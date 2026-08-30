@@ -1,0 +1,342 @@
+variables:
+
+  - name: azureServiceConnection
+    value: 'ARM-ServiceConnection'
+  - name: isHotFix
+    value: true
+
+  - name: snykServiceConnection
+    value: 'Test_Snyk2'
+  
+  - name: browserStackServiceConnection
+    value: 'Test_BrowserStack'
+    
+  - ${{ if eq(lower(variables['Build.SourceBranchName']), 'dev') }}:
+    - name: isHotFix
+      value: false
+    - name: azureServiceConnection
+      value: 'ARM-ServiceConnection'
+    
+  - ${{ if eq(lower(variables['Build.SourceBranchName']), 'uat') }}:
+    - name: isHotFix
+      value: false
+    - name: azureServiceConnection
+      value: 'ARM-ServiceConnection'
+  
+  - ${{ if eq(lower(variables['Build.SourceBranchName']), 'pilot') }}:
+    - name: isHotFix
+      value: false
+    - name: azureServiceConnection
+      value: 'ARM-ServiceConnection'
+  
+  - ${{ if eq(lower(variables['Build.SourceBranchName']), 'production') }}:
+    - name: isHotFix
+      value: false
+    - name: azureServiceConnection
+      value: 'ARM-ServiceConnection'
+  
+  - ${{ if startsWith(lower(variables['Build.SourceBranch']), 'refs/heads/hotfix/') }}:
+    - name: isHotFix
+      value: true
+    - name: azureServiceConnection
+      value: 'ARM-ServiceConnection'
+  
+  - name: qualysServiceConnection
+    value: 'Test_Qualys'
+   
+  - name: dastTool
+    value: 'qualys'
+
+parameters:
+# ---------- Required project-specific parameters ----------
+  - name: projectName
+    type: string
+  
+  - name: pathToProjectBuildFile
+    type: string
+    default: ''
+  # ---------- Optional parameters with defaults ----------
+  - name: environmentConfig
+    type: object
+    default: 
+      dev:
+        environmentName: 'dev'
+        poolName: 'AgentPool-DEV_UAT'
+      uat:
+        environmentName: 'uat'
+        poolName: 'AgentPool-DEV_UAT'
+      pilot:
+        environmentName: 'pilot'
+        poolName: 'AgentPool-DEV_UAT'
+      production:
+        environmentName: 'production'
+        poolName: 'AgentPool-DEV_UAT'
+      dr:
+        environmentName: 'dr'
+        poolName: 'AgentPool-DEV_UAT'
+
+
+  - name: buildCommand
+    type: string
+    default: 'npm run build'
+
+  - name: buildOutputPath
+    type: string
+    default: 'dist'
+
+  - name: BuildType
+    type: string
+    default: 'dotnet'
+    values:
+      - dotnet
+      - java_gradle
+      - java_maven
+  
+  - name: javaVersion
+    type: string
+    default: "17"
+    values:
+      - "11"
+      - "17"
+      - "21"
+  
+  - name: poolName
+    type: string
+    default: ''
+  
+  - name: deployPath
+    type: string
+  
+  - name: qualysWebAppName
+    type: string
+  
+  - name: port
+    type: number
+  
+  - name: customSubFolderForArtifact
+    type: string
+    default: ''
+  - name: customDestinationFolder
+    type: string
+    default: ''
+  
+  - name: qaRepoName
+    type: string
+    default: Plain_QA_Automation_Repo
+  - name: qaAzureProject
+    type: string
+    default: DevSecOps Transformation
+
+  - name: backupRoot
+    type: string
+    default: 'D:\Applications\Backups'
+
+  - name: rollbackToBuildId      # empty = latest backup in manifest
+    type: string
+    default: ''
+  
+  - name: healthCheckPath
+    type: string
+    default: '/'
+
+
+stages:
+  # --------------------------------------------------------------------
+  # Stage 1: Build Legacy App  + SAST Scan
+  # --------------------------------------------------------------------
+  - template: ../templates/stages/dynamic-stage.yml
+    parameters:
+      jobTemplate: ../jobs/build-scan-publish-legacy-backend.yml
+      jobParameters:
+        poolName: ''
+        programmingLanguage: ${{ parameters.BuildType }}
+        pathToProjectBuildFile : ${{ parameters.pathToProjectBuildFile }}
+        javaVersion: ${{ parameters.javaVersion }}
+        BuildType: ${{ parameters.BuildType }}
+      stageName: 'Build_And_Security'
+      displayName: 'Run SAST+SCA Scans, Test, Build and Publish Artifacts '
+           
+  # --------------------------------------------------------------------
+  # Stage 2: Deploy to VirualMachine environments sequentially
+  # --------------------------------------------------------------------
+  - ${{ if ne(variables['isHotFix'], 'true') }}:
+    - template: ../templates/stages/deploy-to-instance-stage.yml
+      parameters:
+        platform: windows
+        target: 'Virtual Machine (VM)'
+        environment: ${{ lower(variables['Build.SourceBranchName']) }}
+        environmentConfig: ${{ parameters.environmentConfig }}
+        projectName: ${{ parameters.projectName }}
+        deploymentParameters:
+          projectName: ${{ coalesce(parameters.projectName, variables['Build.Repository.Name']) }}
+          deployPath: ${{ parameters.deployPath }}
+          port: ${{ parameters.port }}
+
+          customSubFolderForArtifact: ${{parameters.customSubFolderForArtifact}}
+          customDestinationFolder: ${{ parameters.customDestinationFolder }}
+
+  - ${{ else }}:
+    - ${{ each env in split('dev,uat,pilot', ',') }}: #include production before going live with it
+      - template: ../templates/stages/deploy-to-instance-stage.yml
+        parameters:
+          platform: windows
+          target: 'Virtual Machine (VM)'
+          environment: ${{ env }}
+          environmentConfig: ${{ parameters.environmentConfig }}
+          projectName: ${{ parameters.projectName }}
+          deploymentParameters:
+            projectName: ${{ coalesce(parameters.projectName, variables['Build.Repository.Name']) }}
+            deployPath: ${{ parameters.deployPath }}
+            port: ${{ parameters.port }}
+            deploymentType: IISService-Backend
+
+            customSubFolderForArtifact: ${{parameters.customSubFolderForArtifact}}
+            customDestinationFolder: ${{ parameters.customDestinationFolder }}
+
+     #  Run dast scan once after the first deployment to dev environment when it is an hotfix
+      - ${{ if and(eq(variables['isHotFix'], 'true'), eq(env, 'dev')) }}:
+        - template: ../templates/stages/dynamic-stage.yml
+          parameters:
+            jobTemplate: ../jobs/dast-scan.yml
+            jobParameters:
+              poolName: ''
+              qualysWebAppName: ${{ parameters.qualysWebAppName }}
+              qualysServiceConnection: $(qualysServiceConnection)
+              dastTool: $(dastTool)
+              environment: ${{ env }}
+            stageName: DAST_${{ env }}
+            displayName: 'Dynamic Application Security Scanning with Qualys'
+            dependsOn: 
+              - Deploy_${{ env }}
+            condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+        
+        - template: ../templates/stages/dynamic-stage.yml
+          parameters:
+            jobTemplate: ../jobs/qa-test.yml
+            jobParameters:
+              # projectFolder: ${{ coalesce(parameters.projectName, variables['Build.Repository.Name']) }}
+              projectFolder: ''
+              qaAzureProject: ${{parameters.qaAzureProject}}
+              qaRepoName: ${{parameters.qaRepoName}}
+              poolName: ${{ parameters.environmentConfig[env].poolName }}
+              # poolName: ''
+            stageName: 'QA_Test'
+            displayName: 'Run QA test with Browserstack'
+            condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+            dependsOn: 
+            - DAST_${{ env }}
+
+        - template: ../templates/stages/dynamic-stage.yml
+          parameters:
+            jobTemplate: ../jobs/rollback-instance-deployment.yml
+            jobParameters:
+              platform: windows
+              poolName: ''
+              projectName: ${{ parameters.projectName }}
+              deployPath: ${{ parameters.deployPath }}
+              port: ${{ parameters.port }}
+              backupRoot: ${{ parameters.backupRoot }}
+              rollbackToBuildId: ${{ parameters.rollbackToBuildId }}      # empty = latest backup in manifest
+              healthCheckPath: ${{ parameters.healthCheckPath }}
+              environmentConfig: ${{ parameters.environmentConfig[env] }}
+            stageName: 'Rollback_IIS'
+            displayName: 'Rollback IIS Deployments'
+            dependsOn: 
+              -  QA_Test
+            condition: >
+                and(
+                  eq(dependencies.Deploy_${{ env }}.result, 'Succeeded'),
+                  or(eq(dependencies.DAST_${{ env }}.result, 'Failed'), eq(dependencies.QA_Test.result, 'Failed')),
+                  ne(dependencies.Deploy_${{ env }}.outputs['Build_Legacy_Backend.healthGate.ROLLBACK_PERFORMED'], 'true')
+                )
+
+      
+
+ # --------------------------------------------------------------------
+  # Stage 3: Dynamic Security Scanning with DAST: This will not be triggered for hotfixes
+  # -------------------------------------------------------------------
+  - ${{ if ne(variables['isHotFix'], 'true') }}:
+    - template: ../templates/stages/dynamic-stage.yml
+      parameters:
+        jobTemplate: ../jobs/dast-scan.yml
+        dependsOn: 
+          - Deploy_${{ lower(variables['Build.SourceBranchName']) }}
+        condition: "succeeded()"
+        jobParameters:
+          poolName: ''
+          qualysWebAppName: ${{ parameters.qualysWebAppName }}
+          qualysServiceConnection: $(qualysServiceConnection)
+          dastTool: $(dastTool)
+          environment: ${{ lower(variables['Build.SourceBranchName']) }}
+        stageName: DAST_${{ lower(variables['Build.SourceBranchName']) }}
+        displayName: 'Dynamic Application Security Scanning with Qualys'
+
+  
+  # --------------------------------------------------------------------
+  # Stage 4: QA Test Stage
+  # --------------------------------------------------------------------
+  - ${{ if ne(variables['isHotFix'], 'true') }}:
+    - template: ../templates/stages/dynamic-stage.yml
+      parameters:
+        jobTemplate: ../jobs/qa-test.yml
+        dependsOn: 
+          - DAST_${{ lower(variables['Build.SourceBranchName']) }}
+        condition: "succeeded()"
+        jobParameters:
+          projectFolder: ${{ coalesce(parameters.projectName, variables['Build.Repository.Name']) }}
+          qaAzureProject: ${{ parameters.qaAzureProject }}
+          qaRepoName: ${{ parameters.qaRepoName }}
+          poolName: ${{ parameters.environmentConfig[lower(variables['Build.SourceBranchName'])].poolName }}
+          # poolName: ''
+        stageName: 'QA_Test'
+        displayName: 'Run QA test with Browserstack'
+
+  # --------------------------------------------------------------------
+  # Stage 5: QA Test Stage
+  # --------------------------------------------------------------------
+  - ${{ if ne(variables['isHotFix'], 'true') }}:
+    - template: ../templates/stages/dynamic-stage.yml
+      parameters:
+        jobTemplate: ../jobs/rollback-instance-deployment.yml
+        jobParameters:
+          platform: windows
+          poolName: ''
+          projectName: ${{ coalesce(parameters.projectName, variables['Build.Repository.Name']) }}
+          deployPath: ${{ parameters.deployPath }}
+          port: ${{ parameters.port }}
+          backupRoot: ${{ parameters.backupRoot }}
+          rollbackToBuildId: ${{ parameters.rollbackToBuildId }}      # empty = latest backup in manifest
+          healthCheckPath: ${{ parameters.healthCheckPath }}
+          environmentConfig: ${{ parameters.environmentConfig[lower(variables['Build.SourceBranchName'])] }}
+        stageName: 'Rollback_IIS'
+        displayName: 'Rollback IIS Deployments'
+        dependsOn: 
+          - 'QA_Test'
+        condition: >
+            and(
+              eq(dependencies.Deploy_${{ lower(variables['Build.SourceBranchName']) }}.result, 'Succeeded'),
+              or(eq(dependencies.DAST_${{ lower(variables['Build.SourceBranchName']) }}.result, 'Failed'), eq(dependencies.QA_Test.result, 'Failed')),
+              ne(dependencies.Deploy_${{ lower(variables['Build.SourceBranchName']) }}.outputs['Build_Legacy_Backend.healthGate.ROLLBACK_PERFORMED'], 'true')
+            )
+  
+  # --------------------------------------------------------------------
+  # Stage 5: Deploy to DR when deployment to production is successful
+  # --------------------------------------------------------------------
+  - ${{ if eq(lower(variables['Build.SourceBranchName']), 'production') }}:
+    - template: ../templates/stages/deploy-to-instance-stage.yml
+      parameters:
+        platform: windows
+        target: 'Virtual Machine (VM)'
+        environment: 'dr'
+        environmentConfig: ${{ parameters.environmentConfig }}
+        projectName: ${{ parameters.projectName }}
+        deploymentParameters:
+          projectName: ${{ coalesce(parameters.projectName, variables['Build.Repository.Name']) }}
+          deployPath: ${{ parameters.deployPath }}
+          port: ${{ parameters.port }}
+          customSubFolderForArtifact: ${{parameters.customSubFolderForArtifact}}
+          customDestinationFolder: ${{ parameters.customDestinationFolder }}
+          deploymentType: IISService-Backend
+
+      
+    

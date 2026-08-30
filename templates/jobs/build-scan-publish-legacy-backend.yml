@@ -1,0 +1,40 @@
+parameters:
+  - name: BuildType
+    type: string
+
+  - name: poolName
+    type: string
+    default: ''
+    
+  - name: buildConfiguration
+    type: string
+    default: 'Release'
+  
+  - name: pathToProjectBuildFile
+    type: string
+
+  - name: programmingLanguage
+    type: string
+
+
+  - name: javaVersion
+    type: string
+
+jobs:
+  - job: Build_Legacy_Backend
+    displayName: 'Run SAST, SCA scans, Build and Publish Application'
+    ${{ if eq(parameters.poolName, '') }}:
+      pool:
+        vmImage: 'windows-latest'
+    ${{ else }}:
+      pool:
+        name: ${{ parameters.poolName }}
+    steps:
+      - template: ../steps/composite/legacy-backend.yml
+        parameters: 
+          buildConfiguration: ${{ parameters.buildConfiguration }}
+          BuildType: ${{ parameters.BuildType }}
+          programmingLanguage: ${{ parameters.programmingLanguage }}
+          pathToProjectBuildFile: ${{ parameters.pathToProjectBuildFile }}
+          javaVersion: ${{ parameters.javaVersion }}
+

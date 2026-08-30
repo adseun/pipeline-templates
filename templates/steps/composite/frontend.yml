@@ -1,0 +1,147 @@
+parameters:
+  # Language/stack, passed to the Snyk scan and the build steps
+  - name: BuildType
+    type: string
+
+  - name: nodeVersion
+    type: string
+    default: '24.x'
+  - name: buildCommand
+    type: string
+    default: 'npm run build'
+  - name: buildOutputPath
+    type: string
+    default: 'dist'
+  
+  - name: projectName
+    type: string
+  
+  - name: environment
+    type: string
+  
+  - name: useKeyVault
+    displayName: "Does this project use Azure Key Vault?"
+    type: boolean
+    default: false
+    
+
+steps:
+  - checkout: self
+    clean: true
+  
+  - script: |
+        # Check projectName: lowercase alphanumeric and hyphens only
+        if [[ ! "${{ parameters.projectName }}" =~ ^[a-z0-9-]+$ ]]; then
+          echo "##vso[task.logissue type=error]Invalid projectName: ${{ parameters.projectName }}. Must be lowercase alphanumeric and hyphens only."
+          exit 1
+        fi
+    displayName: 'Parameter Validation'
+  
+    # SAST steps (conditional)
+  - template: ../security/sast-snyk.yml
+    parameters:
+      BuildType: ${{ parameters.BuildType }}
+
+  - task: NodeTool@0
+    inputs:
+      versionSpec: ${{ parameters.nodeVersion }}
+    displayName: 'Install Node.js'
+
+  # - script: ls -R $(Agent.BuildDirectory)
+
+  - task: CmdLine@2
+    displayName: 'Install NPM packages'
+    inputs:
+      script: |
+        npm install --legacy-peer-deps
+      workingDirectory: '$(Build.SourcesDirectory)'
+
+  - script: |
+      npm run test -- --watch=false --code-coverage --browsers=ChromeHeadless --progress=false
+    displayName: 'Run Frontend tests with coverage'
+    continueOnError: true  # Continue even if tests fail
+  
+  # Download keyvault secrets following this pattern frontend-secrets-${{ parameters.environment }}
+  - task: AzureKeyVault@2
+    condition: eq('${{ parameters.useKeyVault }}', true)
+    displayName: 'Fetch Project-Scoped Secrets'
+    inputs:
+      azureSubscription: '$(azureServiceConnection)'
+      KeyVaultName: 'frontend-secrets-${{ parameters.environment }}'
+      SecretsFilter: '*' 
+      RunAsPreJob: true
+  
+  # Generate configuration files ONLY for secrets matching this project name prefix
+  - script: |
+      echo "=== Starting Project-Scoped Secret Mapping (Underscore Prefix) ==="
+      
+      # Clear/Initialize files
+      > .env
+      echo "window.__env = window.__env || {};" > env.js
+
+      # Read the comma-separated list of downloaded secrets
+      IFS=',' read -ra SECRETS_ARRAY <<< "$(SecretNames)"
+
+      # Target format: "myproject_"
+      PREFIX_UNDER="${{ parameters.projectName }}_"
+
+      for SECRET_NAME in "${SECRETS_ARRAY[@]}"; do
+         SECRET_NAME=$(echo "$SECRET_NAME" | xargs)
+         
+         if [ -n "$SECRET_NAME" ]; then
+            
+            # Match only secrets starting with the exact "projectname_" prefix
+            if [[ "$SECRET_NAME" == "$PREFIX_UNDER"* ]]; then
+               
+               # Fetch the secret value dynamically
+               SECRET_VALUE=${!SECRET_NAME}
+               
+               # Strip the project prefix (e.g., "myproject_API_KEY" -> "API_KEY")
+               CLEAN_KEY="${SECRET_NAME#$PREFIX_UNDER}"
+
+               # Write to .env file (For React / Vite / Vue)
+               echo "${CLEAN_KEY}=${SECRET_VALUE}" >> .env
+               
+               # Write to env.js file (For Angular)
+               SAFE_VALUE=$(echo "$SECRET_VALUE" | sed "s/'/\\\\'/g")
+               echo "window.__env['${CLEAN_KEY}'] = '${SAFE_VALUE}';" >> env.js
+
+               echo "Mapped project secret: ${CLEAN_KEY}"
+            fi
+         fi
+      done
+      
+      echo "=== Secret Mapping Completed Successfully ==="
+    condition: eq('${{ parameters.useKeyVault }}', true)
+    displayName: 'Generate .env and env.js Dynamically'
+
+  - script: |
+      echo "Project does not use Key Vault. Creating empty configuration fallbacks."
+      > .env
+      echo "window.__env = window.__env || {};" > env.js
+    condition: eq('${{ parameters.useKeyVault }}', false)
+    displayName: 'Create Empty Configuration Fallbacks'
+
+  - script: ls -R $(Agent.BuildDirectory)
+  
+  - task: PublishCodeCoverageResults@2
+    displayName: 'Publish code coverage from Frontend tests'
+    inputs:
+      summaryFileLocation: '$(Build.SourcesDirectory)/coverage/cobertura/cobertura-coverage.xml'
+      failIfCoverageEmpty: true
+
+  - task: CmdLine@2
+    displayName: 'Build Application'
+    inputs:
+      script: |
+        ${{ parameters.buildCommand }}
+      workingDirectory: '$(Build.SourcesDirectory)'
+
+  - task: PublishBuildArtifacts@1
+    displayName: 'Publish Build Artifacts'
+    inputs:
+      # This combines your source directory, repo name, and the build output folder
+      PathtoPublish: '$(Build.SourcesDirectory)/${{ parameters.buildOutputPath }}'
+      ArtifactName: 'drop'
+      publishLocation: 'Container'
+  

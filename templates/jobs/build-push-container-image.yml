@@ -1,0 +1,49 @@
+parameters:
+# ACR Credentials
+  - name: sourceRegistryName
+    type: string
+  - name: sourceRegistryPassword
+    type: string
+
+# Docker Image Details
+  - name: imageName
+    type: string
+  - name: imageVersion
+    type: string
+    default: latest
+  - name: environment
+    type: string
+  - name: poolName
+    type: string
+    default: ''
+
+  - name: projectName
+    type: string
+
+  - name: dockerFilePath
+    type: string
+    default: ''
+    
+jobs:
+  - job: Build_And_Push_Image
+    displayName: 'Build and Push to ACR'
+    ${{ if eq(parameters.poolName, '') }}:
+      pool:
+        vmImage: 'ubuntu-latest'
+    ${{ else }}:
+      pool:
+        name: ${{ parameters.poolName }}
+    steps:
+      - checkout: self
+        clean: true
+
+      - template: ../steps/package/docker-build-push.yml
+        parameters:
+          sourceRegistryName: ${{ parameters.sourceRegistryName }}
+          sourceRegistryPassword: ${{ parameters.sourceRegistryPassword }}
+          imageName: ${{ parameters.imageName }}
+          imageVersion: ${{ parameters.imageVersion }}
+          environment: ${{ parameters.environment }}
+          dockerFilePath: ${{ parameters.dockerFilePath }}
+          projectName: ${{parameters.projectName}}
+

@@ -1,0 +1,35 @@
+parameters:
+  - name: sourceRegistryName
+    type: string
+  - name: sourceRegistryPassword
+    type: string
+  - name: imageName
+    type: string
+  - name: imageVersion
+    type: string
+    default: latest
+  - name: environment
+    type: string
+  - name: poolName
+    type: string
+
+jobs: 
+  - job: ACSScanOnSelfHosted
+    timeoutInMinutes: 30
+    displayName: 'Advanced Redhat Cluster Security (ACS) Scan on Self-Hosted'
+    ${{ if eq(parameters.poolName, '') }}:
+      pool:
+        vmImage: 'ubuntu-latest'
+    ${{ else }}:
+      pool:
+        name: ${{ parameters.poolName }}
+    steps:
+      - template: ../steps/security/rhacs-scan.yml
+        parameters: 
+          poolName: ${{ parameters.poolName }}
+          environment: ${{ parameters.environment }}
+          sourceRegistryName: ${{ parameters.sourceRegistryName }}
+          sourceRegistryPassword: ${{ parameters.sourceRegistryPassword }}
+          imageName: ${{ parameters.imageName }}
+          imageVersion: ${{ parameters.imageVersion }}
+

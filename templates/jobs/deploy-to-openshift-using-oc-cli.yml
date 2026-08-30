@@ -1,0 +1,76 @@
+parameters:
+  - name: targetEnvironment
+    type: string
+    default: dev
+
+  - name: dockerImageName
+    type: string
+
+  - name: imageTag
+    type: string
+    default: "$(Build.BuildId)"
+
+  - name: acrUsername
+    type: string
+  
+  - name: acrPassword
+    type: string
+
+  - name: ocpServer
+    type: string
+  
+  - name: ocpToken
+    type: string
+
+  - name: ocpNamespace
+    type: string
+
+  - name: k8sDirectory
+    type: string
+    default: "k8s"
+  
+  - name: environmentConfig
+    type: object
+    default: {}
+  
+  - name: environment
+    type: string
+  
+  - name: projectName # or appName
+    type: string
+
+  - name: poolName
+    type: string
+
+jobs:
+  - deployment: OpenShiftDeployment
+    displayName: 'Deploy to OpenShift using OC cli'
+    timeoutInMinutes: 20
+    ${{ if eq(parameters.poolName, '') }}:
+      pool:
+        vmImage: 'ubuntu-latest'
+    ${{ else }}:
+      pool:
+        name: ${{ parameters.poolName }}
+    environment: 
+      name: '${{ parameters.environmentConfig.environmentName }}'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - template: ../steps/deploy/openshift-oc.yml
+              parameters:
+                appName: ${{ parameters.projectName }}
+                targetEnvironment: ${{ parameters.targetEnvironment }}
+                dockerImageName: ${{ parameters.dockerImageName }}
+                imageTag: ${{ parameters.imageTag }}
+                acrUsername: ${{ parameters.acrUsername }}
+                acrPassword: ${{ parameters.acrPassword }}
+                ocpServer: ${{ parameters.ocpServer }}
+                ocpToken: ${{ parameters.ocpToken }}
+                ocpNamespace: ${{ parameters.ocpNamespace }}
+                k8sDirectory: ${{ parameters.k8sDirectory }}
+                
+
+
+                

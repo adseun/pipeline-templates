@@ -1,0 +1,92 @@
+parameters:
+  - name: buildConfiguration
+    type: string
+    default: 'release'
+  - name: javaVersion
+    type: string
+    default: '17'
+
+steps:
+  # Set up the Java Development Kit (JDK)
+  - task: JavaToolInstaller@0
+    displayName: 'Install JDK ${{ parameters.javaVersion }}'
+    inputs:
+      versionSpec: ${{ parameters.javaVersion }}
+      jdkSource: 'preinstalled'
+      jdkArchitectureOption: 'x64'
+
+  # Restore & Build (Gradle 'compileJava' handles restoration and compilation)
+  - task: Gradle@3
+    displayName: 'Gradle Build'
+    inputs:
+      gradleWrapperFile: 'gradlew'
+      tasks: 'clean compileJava'
+      publishJUnitResults: false
+
+  # Test and collect coverage (Generates jacocoTestReport xml code coverage)
+  - task: Gradle@3
+    displayName: 'Run Tests & Collect JaCoCo Coverage'
+    inputs:
+      gradleWrapperFile: 'gradlew'
+      tasks: 'test jacocoTestReport'
+      options: '-PbuildConfiguration=${{ parameters.buildConfiguration }}' # Pass build profile if applicable
+      publishJUnitResults: true
+      testResultsFiles: '**/build/test-results/test/TEST-*.xml' # Standard Gradle JUnit output path
+
+  # Publish code coverage XML report to Azure DevOps UI
+  - task: PublishCodeCoverageResults@2
+    displayName: 'Publish Code Coverage'
+    condition: succeeded()
+    inputs:
+      summaryFileLocation: '$(System.DefaultWorkingDirectory)/**/build/reports/jacoco/test/jacocoTestReport.xml' # Standard Gradle JaCoCo path
+      pathToSources: '$(System.DefaultWorkingDirectory)/src/main/java/'
+      failIfCoverageEmpty: false
+
+  # Validate 10% coverage threshold via native Linux parsing
+  - script: |
+      # Locate the generated jacoco coverage file
+      file=$(find $(System.DefaultWorkingDirectory) -name "jacocoTestReport.xml" -o -name "jacoco.xml" | head -n 1)
+      
+      if [ -z "$file" ] || [ ! -f "$file" ]; then
+        echo "##vso[task.logissue type=warning]No JaCoCo XML coverage file found. Skipping threshold validation."
+        exit 0
+      fi
+      
+      echo "Found JaCoCo file at: $file"
+      echo "Evaluating 10% line coverage threshold..."
+      
+      # Extract 'LINE' missed and covered attributes using grep and sed
+      # Looks for pattern: <counter type="LINE" missed="X" covered="Y"/>
+      line_counter=$(grep -o '<counter type="LINE"[^>]*>' "$file" | head -n 1)
+      
+      if [ -z "$line_counter" ]; then
+        echo "##vso[task.logissue type=error]Could not find LINE counter metrics in JaCoCo XML report."
+        exit 1
+      fi
+      
+      missed=$(echo "$line_counter" | sed -E 's/.*missed="([0-9]+)".*/\1/')
+      covered=$(echo "$line_counter" | sed -E 's/.*covered="([0-9]+)".*/\1/')
+      
+      total=$((missed + covered))
+      
+      if [ "$total" -eq 0 ]; then
+        echo "Total lines found is 0. Cannot calculate percentage."
+        exit 0
+      fi
+      
+      # Calculate whole integer percentage (Scale by 100)
+      coverage_percentage=$(( (covered * 100) / total ))
+      
+      echo "Total Lines: $total"
+      echo "Covered Lines: $covered"
+      echo "Calculated Line Coverage: ${coverage_percentage}%"
+      
+      # Enforce the 10% minimum threshold
+      if [ "$coverage_percentage" -lt 10 ]; then
+        echo "##vso[task.logissue type=error]Code coverage (${coverage_percentage}%) is below the required 10% threshold!"
+        exit 1
+      else
+        echo "Code coverage validation passed successfully!"
+      fi
+    displayName: 'Validate Code Coverage Threshold'
+    condition: succeeded()

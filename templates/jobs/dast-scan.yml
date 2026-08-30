@@ -1,0 +1,38 @@
+parameters:   
+  - name: qualysWebAppName
+    type: string
+      
+  - name: qualysServiceConnection
+    type: string
+    
+  - name: poolName
+    type: string
+    default: ''
+    
+  - name: dastTool
+    type: string
+  
+  - name: environment
+    type: string
+
+jobs: 
+  - job: DastScan
+    timeoutInMinutes: 120
+    displayName: 'Run DAST Scan with Qualys'
+    ${{ if eq(parameters.poolName, '') }}:
+      pool:
+        vmImage: 'ubuntu-latest'
+    ${{ else }}:
+      pool:
+        name: ${{ parameters.poolName }}
+
+    steps:
+      # DAST steps (conditional)
+      # - ${{ if eq(parameters.dastTool, 'qualys') }}:
+        - template: ../steps/security/dast-qualys.yml
+          parameters:
+            qualysWebAppName: ${{ parameters.qualysWebAppName }}
+            qualysServiceConnection: ${{ parameters.qualysServiceConnection }} 
+
+
+    

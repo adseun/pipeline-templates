@@ -1,0 +1,137 @@
+parameters:
+  - name: buildConfiguration
+    type: string
+    default: 'Release' # Kept for parameter matching; mapped to production properties in Java
+  - name: javaVersion
+    type: string
+    default: '17'
+steps:
+  # Set up the Java Development Kit (JDK)
+  - task: JavaToolInstaller@0
+    displayName: 'Install JDK 17'
+    inputs:
+      versionSpec: ${{ parameters.javaVersion }}
+      jdkSource: 'PreInstalled'
+      jdkArchitectureOption: 'x64'
+
+  # Restore & Build (Maven 'compile' handles dependency restoration and compilation)
+  - task: Maven@4
+    displayName: 'Maven Build'
+    inputs:
+      mavenPomFile: 'pom.xml'
+      goals: 'clean compile'
+      options: '-DskipTests=true' # We only compile here; tests happen in the next step
+      publishJUnitResults: false
+
+  # Test and Collect Coverage (Generates jacoco.xml code coverage)
+  - task: Maven@4
+    displayName: 'Run Tests & Collect JaCoCo Coverage'
+    inputs:
+      mavenPomFile: 'pom.xml'
+      goals: 'test'
+      options: '-P ${{ parameters.buildConfiguration }}' # Pass build profile if applicable
+      publishJUnitResults: true
+      testResultsFiles: '**/TEST-*.xml'
+
+  # Publish Code Coverage XML Report to Azure DevOps UI
+  - task: PublishCodeCoverageResults@2
+    displayName: 'Publish Code Coverage'
+    condition: succeeded()
+    inputs:
+      summaryFileLocation: '$(System.DefaultWorkingDirectory)/**/target/site/jacoco/jacoco.xml'
+      # CRITICAL FOR JAVA: Tells Azure DevOps where your raw .java source code lives
+      pathToSources: '$(System.DefaultWorkingDirectory)/src/main/java/'
+      failIfCoverageEmpty: false 
+
+
+  # Validate 10% Coverage Threshold via Native Linux Parsing
+  - script: |
+      # Locate the generated JaCoCo coverage file
+      FILE=$(find $(System.DefaultWorkingDirectory) -name "jacoco.xml" | head -n 1)
+      
+      if [ -z "$FILE" ] || [ ! -f "$FILE" ]; then
+        echo "No JaCoCo XML coverage file found. Skipping threshold validation."
+        exit 0
+      fi
+
+      echo "Found JaCoCo file at: $FILE"
+      echo "Evaluating 10% coverage threshold..."
+      
+      # JaCoCo structures metrics at the bottom under <counter type="LINE" missed="X" covered="Y"/>
+      # Extract missed and covered line counts
+      MISSED_LINES=$(grep -Po '(?<=<counter type="LINE" missed=")[0-9]*' "$FILE" | head -n 1)
+      COVERED_LINES=$(grep -Po '(?<=missed="'"$MISSED_LINES"'" covered=")[0-9]*' "$FILE" | head -n 1)
+
+      if [ -z "$MISSED_LINES" ] || [ -z "$COVERED_LINES" ]; then
+        echo "##vso[task.logissue type=error]Could not parse line coverage metrics from jacoco.xml."
+        exit 1
+      fi
+
+      TOTAL_LINES=$((MISSED_LINES + COVERED_LINES))
+      
+      if [ "$TOTAL_LINES" -eq 0 ]; then
+        echo "No executable code lines found. Skipping."
+        exit 0
+      fi
+
+      # Calculate percentage
+      PERCENTAGE=$(awk "BEGIN {print ($COVERED_LINES / $TOTAL_LINES) * 100}")
+      echo "Current Overall Line Coverage: $PERCENTAGE%"
+
+      # Check against 10% limit
+      IS_BELOW_THRESHOLD=$(awk "BEGIN {print ($PERCENTAGE < 10.0) ? 1 : 0}")
+      
+      if [ "$IS_BELOW_THRESHOLD" -eq 1 ]; then
+        echo "##vso[task.logissue type=error]Code coverage ($PERCENTAGE%) is below the mandatory 10% threshold!"
+        exit 1
+      fi
+      
+      echo "Code coverage threshold validation passed successfully."
+    displayName: 'Validate 10% Coverage Threshold'
+
+  # Publish Code Build Results (Packages the application into target/*.jar or *.war)
+  - task: Maven@4
+    displayName: 'Package Java Application'
+    inputs:
+      mavenPomFile: 'pom.xml'
+      goals: 'package'
+      options: '-DskipTests=true' # Skip tests since we already ran and verified them
+      publishJUnitResults: false
+
+  # Copy build artifacts to the staging directory
+  - task: CopyFiles@2
+    displayName: 'Stage Package Artifacts'
+    inputs:
+      SourceFolder: '$(System.DefaultWorkingDirectory)'
+      Contents: '**/target/*.@(jar|war)'
+      TargetFolder: '$(Build.ArtifactStagingDirectory)'
+      FlattenFolders: true
+
+  # Upload Artifacts
+  - task: PublishBuildArtifacts@1
+    displayName: 'Upload Artifacts'
+    inputs:
+      pathtoPublish: '$(Build.ArtifactStagingDirectory)' 
+      artifactName: 'API'
+
+
+# required configuration check: install jacoco plugin
+# <plugin>
+#     <groupId>org.jacoco</groupId>
+#     <artifactId>jacoco-maven-plugin</artifactId>
+#     <version>0.8.11</version>
+#     <executions>
+#         <execution>
+#             <goals>
+#                 <goal>prepare-agent</goal>
+#             </goals>
+#         </execution>
+#         <execution>
+#             <id>report</id>
+#             <phase>test</phase>
+#             <goals>
+#                 <goal>report</goal>
+#             </goals>
+#         </execution>
+#     </executions>
+# </plugin>

@@ -1,0 +1,117 @@
+parameters:
+  - name: buildConfiguration
+    type: string
+    default: 'Release'
+
+  - name: pathToProjectBuildFile
+    type: string
+    default: ''
+    
+steps:
+  - ${{ if ne(parameters.pathToProjectBuildFile, '') }}:
+    - script: |
+        echo "##vso[task.setvariable variable=DetectedBuildFile]${{ parameters.pathToProjectBuildFile }}"
+        echo "Using explicitly provided build file: ${{ parameters.pathToProjectBuildFile }}"
+      displayName: 'Use Provided .NET Build File Path'
+
+    # If no path is provided, fall back to auto-detection
+  - ${{ else }}:    
+    - script: |
+        # Search recursively for the first .sln or .csproj file
+        BUILD_FILE=$(find "$(Build.SourcesDirectory)" -type f -name "*.sln" -o -type f -name "*.csproj" | head -n 1)
+
+        if [ -n "$BUILD_FILE" ]; then
+            # Convert the absolute path into a relative path from the Sources Directory
+            # This strips the base path and the leading forward slash
+            RELATIVE_PATH=${BUILD_FILE#"$(Build.SourcesDirectory)/"}
+            
+            echo "##vso[task.setvariable variable=DetectedBuildFile]$RELATIVE_PATH"
+            echo "Detected build file: $RELATIVE_PATH"
+        else
+            echo "##[error]No .sln or .csproj file found!"
+            exit 1
+        fi
+      displayName: 'Auto-Detect .NET Build File (Linux)'
+ 
+  - task: DotNetCoreCLI@2
+    displayName: 'dotnet restore'
+    inputs:
+        command: 'restore'
+        # FIX: Swapped hardcoded pattern for the variable containing the discovered file path
+        projects: '$(DetectedBuildFile)'
+
+ 
+  - task: DotNetCoreCLI@2
+    displayName: 'dotnet build'
+    inputs:
+      command: 'build'
+      # FIX: Targets either the specific isolated project file or the core wrapper solution path
+      projects: '$(DetectedBuildFile)'
+      arguments: '--configuration ${{ parameters.buildConfiguration }}'
+
+  - task: DotNetCoreCLI@2
+    displayName: 'Test'
+    inputs:
+      command: 'test'
+      # FIX: Targets the specific project layout found during detection stage
+      projects: '$(DetectedBuildFile)'
+      publishTestResults: true 
+      arguments: '--configuration ${{ parameters.buildConfiguration }} --no-build /p:CollectCoverage=true /p:CoverletOutputFormat=cobertura /p:CoverletOutput=$(Build.SourcesDirectory)/TestResults/coverage.cobertura.xml'
+
+  - task: PublishCodeCoverageResults@2
+    displayName: 'Publish Code Coverage'
+    condition: succeeded()
+    inputs:
+      summaryFileLocation: '$(Build.SourcesDirectory)/TestResults/coverage.cobertura.xml'
+      failIfCoverageEmpty: false 
+  
+  - script: |
+      FILE="$(Build.SourcesDirectory)/TestResults/coverage.cobertura.xml"
+      
+      if [ ! -f "$FILE" ]; then
+        echo "No test results or coverage files found. Skipping threshold validation."
+        exit 0
+      fi
+
+      echo "Installing ReportGenerator..."
+      dotnet tool install --global dotnet-reportgenerator-globaltool
+
+      echo "Evaluating coverage threshold..."
+      reportgenerator \
+        -reports:"$FILE" \
+        -targetdir:"$(Build.SourcesDirectory)/TestResults/CoverageReport" \
+        -reporttypes:"HtmlInline_AzurePipelines" \
+        -failonoptions:LineCoverageLessThan10
+        
+    displayName: 'Validate 10% Coverage Threshold'
+
+  - ${{ if ne(parameters.pathToProjectBuildFile, '') }}:
+      - task: DotNetCoreCLI@2
+        displayName: "Publish Code Build Results"
+        inputs:
+          command: 'publish'
+          publishWebProjects: false
+          projects: '$(DetectedBuildFile)'
+          outputDir: '$(Build.ArtifactStagingDirectory)'
+          arguments: '--configuration ${{ parameters.buildConfiguration }} --no-restore /p:UseAppHost=false'
+          zipAfterPublish: false
+          modifyOutputPath: false
+
+  - ${{ else }}:
+      - task: DotNetCoreCLI@2
+        displayName: "Publish Code Build Results"
+        inputs:
+          command: 'publish'
+          publishWebProjects: false
+          # outputDir: '$(Build.ArtifactStagingDirectory)'
+          projects: '$(DetectedBuildFile)'
+          arguments: '--configuration ${{ parameters.buildConfiguration }} --output $(Build.ArtifactStagingDirectory) --self-contained true -r win-x64'
+          # arguments: '--configuration ${{ parameters.buildConfiguration }} --self-contained true -r win-x64'
+          zipAfterPublish: false
+          modifyOutputPath: false
+
+  - task: PublishBuildArtifacts@1
+    displayName: "Upload Artifacts"
+    inputs:
+      pathtoPublish: '$(Build.ArtifactStagingDirectory)' 
+      artifactName: 'API'

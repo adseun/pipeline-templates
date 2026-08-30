@@ -1,0 +1,148 @@
+parameters:
+  - name: sourceRegistryName
+    type: string
+  - name: sourceRegistryPassword
+    type: string
+  - name: imageName
+    type: string
+  - name: imageVersion
+    type: string
+  - name: environment
+    type: string
+  - name: poolName
+    type: string
+  - name: failureThreshold
+    type: string
+    default: High
+    
+steps:
+    # Step 1: Image vulnerability scan
+    - script: |
+        set -e
+
+        if [ "$(isHotFix)" == "true" ]; then
+          IMMUTABLE_TAG="hotfix-$(Build.BuildId)"
+        elif [ "${{ parameters.environment }}" == "dev" ]; then
+          IMMUTABLE_TAG="$(Build.BuildId)"
+        else
+          IMMUTABLE_TAG="$(IMMUTABLE_TAG)"  
+        fi
+
+        roxctl --insecure-skip-tls-verify \
+            -e "$(ACS-ENDPOINT)" \
+            image scan \
+            --image "${{ parameters.sourceRegistryName }}.azurecr.io/${{ parameters.imageName }}:$IMMUTABLE_TAG" \
+            --force \
+            --output table
+      displayName: 'RHACS Image Scan (CVEs)'
+      env:
+        ROX_API_TOKEN: $(ACS-token)
+      # continueOnError: true
+
+    # Step 2: Sign Image only in dev
+    - ${{ if eq(parameters.environment, 'dev') }}:
+      - script: |
+          # Check if cosign key exists
+          if [ ! -f "/usr/local/etc/cosign.key" ]; then
+          echo "❌ Cosign key not found at /root/cosign.key"
+          echo "Skipping image signing..."
+          exit 0
+          fi
+          
+          # Install cosign if not present
+          if ! command -v cosign &> /dev/null; then
+          echo "📦 Installing cosign..."
+          curl -sSL https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 -o /usr/local/bin/cosign
+          chmod +x /usr/local/bin/cosign
+          fi
+
+          IMMUTABLE_TAG=$(IMMUTABLE_TAG)
+          # Use docker inspect to get the digest reliably (it's cleaner than grepping push output)
+          IMAGE_REF="${{ parameters.sourceRegistryName }}.azurecr.io/${{ parameters.imageName }}:$IMMUTABLE_TAG"
+          # docker push "$IMAGE_REF"
+
+
+          # Login to ACR if needed for authentication
+          # docker login -u ${{ parameters.sourceRegistryName }} -p ${{ parameters.sourceRegistryPassword }} ${{ parameters.sourceRegistryName }}.azurecr.io
+          echo "${{ parameters.sourceRegistryPassword }}" | docker login ${{ parameters.sourceRegistryName }}.azurecr.io -u ${{ parameters.sourceRegistryName }} --password-stdin
+          
+          # If it was built in a previous step/job, we may need to pull it first.
+          docker pull "$IMAGE_REF"
+
+          IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE_REF")
+
+          echo "🔐 Signing image digest: $IMAGE_DIGEST"
+
+          export COSIGN_EXPERIMENTAL=0
+          export COSIGN_SKIP_TLOG=true
+
+          # Sign the image
+          cosign sign \
+          --key /usr/local/etc/cosign.key \
+          --yes \
+          "$IMAGE_DIGEST"
+
+          if [ $? -eq 0 ]; then
+          echo "✅ Image signed successfully"
+          
+          # Verify using the PUBLIC key (ensure cosign.pub exists in that path)
+          # If you only have the .key file, you must generate the .pub first
+          cosign verify \
+              --key /usr/local/etc/cosign.pub \
+              --check-claims=false \
+              "$IMAGE_DIGEST"
+          
+          if [ $? -eq 0 ]; then
+              echo "✅ Signature verified successfully"
+          else
+              echo "⚠️ Signature verification failed. Check if /usr/local/etc/cosign.pub is valid."
+              exit 1
+          fi
+          else
+          echo "❌ Image signing failed"
+          exit 1
+          fi
+
+        displayName: 'Sign image with Cosign (Dev environment only)'
+        condition: and(succeeded(), eq(variables['Agent.OS'], 'Linux'))
+        env:
+            COSIGN_PASSWORD: $(COSIGN_KEY_PASSWORD)
+
+
+
+
+     # Install az cli if it does not exist
+      - script: |
+         if ! command -v az &> /dev/null; then
+           echo "Azure CLI not found. Installing..."
+           curl -sL https://aka.ms | sudo bash
+         else
+           echo "Azure CLI is already installed."
+         fi
+        displayName: 'Ensure Azure CLI is installed'
+
+
+    # Step 3: Policy compliance check (breaks build on violations)
+    - script: |
+        set -e
+
+        IMMUTABLE_TAG=$(IMMUTABLE_TAG)
+        roxctl --insecure-skip-tls-verify \
+            -e "$(ACS-ENDPOINT)" \
+            image check \
+            --image "${{ parameters.sourceRegistryName }}.azurecr.io/${{ parameters.imageName }}:$IMMUTABLE_TAG" \
+            --force \
+            --output table
+      displayName: 'RHACS Policy Check (Build Gate)'
+      env:
+        ROX_API_TOKEN: $(ACS-token)
+      # continueOnError: true
+    
+
+    - script: |
+         echo "================================================"
+         echo "  RHACS Image Scan complete — PASSED"
+         echo "  Environment : ${{ parameters.environment }}"
+         echo "  Threshold   : ${{ parameters.failureThreshold }} and above"
+         echo "  Image       : $(IMMUTABLE_TAG)"
+      condition: and(eq(variables['SCAN_PASSED'], 'true'), eq(variables['CHECK_PASSED'], 'true'))

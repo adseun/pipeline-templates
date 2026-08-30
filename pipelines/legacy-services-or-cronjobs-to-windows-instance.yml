@@ -1,0 +1,283 @@
+variables:
+
+  - name: azureServiceConnection
+    value: 'ARM-ServiceConnection'
+  - name: isHotFix
+    value: true
+  
+  - name: snykServiceConnection
+    value: 'Test_Snyk2'
+  
+  - name: browserStackServiceConnection
+    value: 'Test_BrowserStack'
+  
+  - ${{ if eq(lower(variables['Build.SourceBranchName']), 'dev') }}:
+    - name: isHotFix
+      value: false
+    - name: azureServiceConnection
+      value: 'ARM-ServiceConnection'
+    
+  - ${{ if eq(lower(variables['Build.SourceBranchName']), 'uat') }}:
+    - name: isHotFix
+      value: false
+    - name: azureServiceConnection
+      value: 'ARM-ServiceConnection'
+  
+  - ${{ if eq(lower(variables['Build.SourceBranchName']), 'pilot') }}:
+    - name: isHotFix
+      value: false
+    - name: azureServiceConnection
+      value: 'ARM-ServiceConnection'
+  
+  - ${{ if eq(lower(variables['Build.SourceBranchName']), 'production') }}:
+    - name: isHotFix
+      value: false
+    - name: azureServiceConnection
+      value: 'ARM-ServiceConnection'
+  
+  - ${{ if startsWith(lower(variables['Build.SourceBranch']), 'refs/heads/hotfix/') }}:
+    - name: azureServiceConnection
+      value: 'ARM-ServiceConnection'
+    - name: isHotFix
+      value: true
+  
+  - name: qualysServiceConnection
+    value: 'Test_Qualys'
+   
+  - name: dastTool
+    value: 'qualys'
+
+parameters:
+  # ---------- Required project-specific parameters ----------
+  - name: projectName
+    type: string
+  
+  - name: pathToProjectBuildFile
+    type: string
+    default: ''
+  
+  # ---------- Optional parameters with defaults ----------
+  - name: environmentConfig
+    type: object
+    default: 
+      dev:
+        environmentName: 'dev'
+        poolName: 'AgentPool-DEV_UAT'
+      uat:
+        environmentName: 'uat'
+        poolName: 'AgentPool-DEV_UAT'
+      pilot:
+        environmentName: 'pilot'
+        poolName: 'AgentPool-DEV_UAT'
+      production:
+        environmentName: 'production'
+        poolName: 'AgentPool-DEV_UAT'
+      dr:
+        environmentName: 'dr'
+        poolName: 'AgentPool-DEV_UAT'
+
+
+  - name: buildCommand
+    type: string
+    default: 'npm run build'
+
+  - name: buildOutputPath
+    type: string
+    default: 'dist'
+
+  - name: BuildType
+    type: string
+    default: 'dotnet'
+    values:
+      - dotnet
+      - java_gradle
+      - java_maven
+  
+  - name: poolName
+    type: string
+    default: ''
+  
+  - name: deployPath
+    type: string
+  
+  - name: qualysWebAppName
+    type: string
+  
+  - name: port
+    type: number
+  
+  - name: customSubFolderForArtifact
+    type: string
+    default: ''
+  - name: customDestinationFolder
+    type: string
+    default: ''
+
+
+    # common to both cronjob and windows services
+  - name: binaryPath
+    type: string
+
+    # cron job specific parameters
+  - name: cronSchedule
+    type: string
+    default: '09:00' # Trigger time if deploymentType is CronJob (24-hour format)
+  - name: runAsUser
+    type: string
+    default: 'NT AUTHORITY\SYSTEM' # Execution context
+
+  
+  - name: qaRepoName
+    type: string
+    default: Plain_QA_Automation_Repo
+  - name: qaAzureProject
+    type: string
+    default: DevSecOps Transformation
+  
+  - name: backupRoot
+    type: string
+    default: 'D:\Applications\Backups'
+
+  - name: rollbackToBuildId      # empty = latest backup in manifest
+    type: string
+    default: ''
+  - name: deploymentType
+    type: string
+    default: 'WindowsService'
+    values: ['WindowsService', 'CronJob']
+
+
+stages:
+  # --------------------------------------------------------------------
+  # Stage 1: Build Legacy App  + SAST Scan
+  # --------------------------------------------------------------------
+  - template: ../templates/stages/dynamic-stage.yml
+    parameters:
+      jobTemplate: ../jobs/build-scan-publish-legacy-backend.yml
+      jobParameters:
+        poolName: ''
+        programmingLanguage: ${{ parameters.BuildType }}
+        pathToProjectBuildFile : ${{ parameters.pathToProjectBuildFile }}
+        BuildType: ${{ parameters.BuildType }}
+      stageName: 'Build_And_Security'
+      displayName: 'Run SAST+SCA Scans, Test, Build and Publish Artifacts '
+           
+  # --------------------------------------------------------------------
+  # Stage 2: Deploy to VirualMachine environments sequentially
+  # --------------------------------------------------------------------
+  - ${{ if ne(variables['isHotFix'], 'true') }}:
+    - template: ../templates/stages/deploy-to-instance-stage.yml
+      parameters:
+        platform: windows-worker
+        target: 'Virtual Machine (VM)'
+        environment: ${{ lower(variables['Build.SourceBranchName']) }}
+        environmentConfig: ${{ parameters.environmentConfig }}
+        projectName: ${{ parameters.projectName }}
+        deploymentParameters:
+          projectName: ${{ coalesce(parameters.projectName, variables['Build.Repository.Name']) }}
+          deployPath: ${{ parameters.deployPath }}
+
+          customSubFolderForArtifact: ${{parameters.customSubFolderForArtifact}}
+          customDestinationFolder: ${{ parameters.customDestinationFolder }}
+
+          binaryPath: ${{ parameters.binaryPath }}
+          cronSchedule: ${{ parameters.cronSchedule }}
+          runAsUser: ${{ parameters.runAsUser }}
+
+    - template: ../templates/stages/dynamic-stage.yml
+      parameters:
+        jobTemplate: ../jobs/rollback-instance-deployment.yml
+        jobParameters:
+          platform: windows-worker
+          projectName: ${{ parameters.projectName }}
+          deployPath: ${{ parameters.deployPath }}
+          backupRoot: ${{ parameters.backupRoot }}
+          rollbackToBuildId: ${{ parameters.rollbackToBuildId }}      # empty = latest backup in manifest
+          deploymentType: ${{ parameters.deploymentType }}
+          binaryPath: ${{ parameters.binaryPath }}
+
+          poolName: ''
+          environmentConfig: ${{ parameters.environmentConfig[env] }}
+        stageName: 'Rollback_CronJob_WindowsService'
+        displayName: 'Rollback Cronjob or WindowsServiceDeployments'
+        dependsOn: 
+          -  Build_And_Security
+        condition: >
+            and(
+              eq(dependencies.Deploy_${{ env }}.result, 'Succeeded'),
+              or(eq(dependencies.DAST_${{ env }}.result, 'Failed'), eq(dependencies.QA_Test.result, 'Failed')),
+              ne(dependencies.Deploy_${{ env }}.outputs['Build_Legacy_CronJobs_WindowsServices.healthGate.ROLLBACK_PERFORMED'], 'true')
+            )
+
+  - ${{ else }}:
+    - ${{ each env in split('dev,uat,pilot', ',') }}: # include production before going live with it
+      - template: ../templates/stages/deploy-to-instance-stage.yml
+        parameters:
+          platform: windows-worker
+          target: 'Virtual Machine (VM)'
+          environment: ${{ env }}
+          environmentConfig: ${{ parameters.environmentConfig }}
+          projectName: ${{ parameters.projectName }}
+          deploymentParameters:
+            projectName: ${{ coalesce(parameters.projectName, variables['Build.Repository.Name']) }}
+            deployPath: ${{ parameters.deployPath }}
+            deploymentType: ${{ parameters.deploymentType }}
+
+            customSubFolderForArtifact: ${{parameters.customSubFolderForArtifact}}
+            customDestinationFolder: ${{ parameters.customDestinationFolder }}
+
+            binaryPath: ${{ parameters.binaryPath }}
+            cronSchedule: ${{ parameters.cronSchedule }}
+            runAsUser: ${{ parameters.runAsUser }}
+
+      - ${{ if and(eq(variables['isHotFix'], 'true'), eq(env, 'dev')) }}:
+        - template: ../templates/stages/dynamic-stage.yml
+          parameters:
+            jobTemplate: ../jobs/rollback-instance-deployment.yml
+            jobParameters:
+              platform: windows-worker
+              projectName: ${{ parameters.projectName }}
+              deployPath: ${{ parameters.deployPath }}
+              backupRoot: ${{ parameters.backupRoot }}
+              rollbackToBuildId: ${{ parameters.rollbackToBuildId }}      # empty = latest backup in manifest
+              deploymentType: ${{ parameters.deploymentType }}
+              binaryPath: ${{ parameters.binaryPath }}
+
+              poolName: ''
+              environmentConfig: ${{ parameters.environmentConfig[env] }}
+            stageName: 'Rollback_CronJob_WindowsService'
+            displayName: 'Rollback Cronjob or WindowsServiceDeployments'
+            dependsOn: 
+              -  Deploy_${{ env }}
+            condition: >
+                and(
+                  eq(dependencies.Deploy_${{ env }}.result, 'Succeeded'),
+                  or(eq(dependencies.DAST_${{ env }}.result, 'Failed'), eq(dependencies.QA_Test.result, 'Failed')),
+                  ne(dependencies.Deploy_${{ env }}.outputs['Build_Legacy_CronJobs_WindowsServices.healthGate.ROLLBACK_PERFORMED'], 'true')
+                )
+
+
+  # --------------------------------------------------------------------
+  # Stage 3: Deploy to DR when deployment to production is successful
+  # --------------------------------------------------------------------
+  - ${{ if eq(lower(variables['Build.SourceBranchName']), 'production') }}:
+    - template: ../templates/stages/deploy-to-instance-stage.yml
+      parameters:
+        platform: windows-worker
+        target: 'Virtual Machine (VM)'
+        environment: 'dr'
+        environmentConfig: ${{ parameters.environmentConfig }}
+        projectName: ${{ parameters.projectName }}
+        deploymentParameters:
+            projectName: ${{ coalesce(parameters.projectName, variables['Build.Repository.Name']) }}
+            deployPath: ${{ parameters.deployPath }}
+            deploymentType: ${{ parameters.deploymentType }}
+
+            customSubFolderForArtifact: ${{parameters.customSubFolderForArtifact}}
+            customDestinationFolder: ${{ parameters.customDestinationFolder }}
+
+            binaryPath: ${{ parameters.binaryPath }}
+            cronSchedule: ${{ parameters.cronSchedule }}
+            runAsUser: ${{ parameters.runAsUser }}
+      
+    

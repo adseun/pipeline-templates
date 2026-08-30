@@ -1,0 +1,72 @@
+parameters:
+  - name: projectFolder
+    type: string
+
+  - name: qaAzureProject
+    type: string
+
+  - name: qaRepoName
+    type: string
+
+steps:
+    - checkout: self
+
+    - ${{ if eq(parameters.projectFolder, '') }}:
+      - checkout: git://QA_Automation_Repo/${{ parameters.qaRepoName }}@main
+
+    - ${{ else }}:
+      - checkout: git://QA_Automation_Repo/${{ parameters.qaRepoName }}@main
+        sparseCheckoutDirectories: ${{ parameters.projectFolder }}
+        
+    - task: BrowserStackConfig@0
+      inputs:
+        BrowserStackServiceEndPoint: '$(browserStackServiceConnection)'
+        browserstackLocal: true
+
+    # Setup Python Environment
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '3.x' # Or specific like '3.11'
+        addToPath: true
+      displayName: 'Install Python'
+
+    # Setup Node.js Environment
+    - task: UseNode@1
+      inputs:
+        versionSpec: '24.x' # Or specific like '20.x'
+      displayName: 'Install Node.js'
+
+    - script: |
+        echo "Starting tests for ${{ parameters.projectFolder }}..."
+        cd $(Build.SourcesDirectory)/${{ parameters.qaRepoName }}/${{ parameters.projectFolder }}
+
+        # 1. Check for JavaScript (Node.js)
+        if [ -f "package.json" ]; then
+        echo "Detected JavaScript project. Running npm..."
+        npm install
+        npm run sample-test
+        
+        # 2. Check for Python
+        elif [ -f "requirements.txt" ]; then
+        echo "Detected Python project. Running pytest..."
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        browserstack-sdk pytest -s tests/sample-test.py
+        # pytest --browserstack  # Or your specific python test command
+        
+        else
+        echo "No recognized test files found in ${{ parameters.projectFolder }}"
+        exit 1
+        fi
+      displayName: 'Run Dynamic Python or JS Tests'
+      env:
+        # Ensure BrowserStack credentials are mapped to what your scripts expect
+        BROWSERSTACK_USERNAME: $(BROWSERSTACK_USERNAME)
+        BROWSERSTACK_ACCESS_KEY: $(BROWSERSTACK_ACCESS_KEY)
+        BROWSERSTACK_PROJECT_NAME: ${{ parameters.projectFolder }}
+
+    - task: BrowserStackStopLocal@0
+    - task: BrowserStackResults@1
+      inputs:
+        browserstackProduct: 'automate'
+        reportTimeout: '130'

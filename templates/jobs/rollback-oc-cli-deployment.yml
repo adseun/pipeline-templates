@@ -1,0 +1,49 @@
+parameters:
+  - name: projectName
+    type: string
+  - name: poolName
+    type: string
+
+  - name: environment
+    type: string
+    default: dev
+  - name: imageName
+    type: string
+  - name: acrUsername
+    type: string
+  - name: ocpServer
+    type: string
+  - name: ocpToken
+    type: string
+  - name: ocpNamespace
+    type: string
+  - name: rollbackToTag          # empty = use variable group / rollout undo
+    type: string
+    default: ''
+  - name: rolloutTimeout
+    type: string
+    default: "180s"
+
+jobs:
+  - job: RollBack_Openshift
+    displayName: 'Rollback oc cli deployment to Openshift'
+    ${{ if eq(parameters.poolName, '') }}:
+      pool:
+        vmImage: 'ubuntu-latest'
+    ${{ else }}:
+      pool:
+        name: ${{ parameters.poolName }}
+    steps:
+      - template: ../steps/rollback/openshift-oc.yml
+        parameters:
+            targetEnvironment: ${{ parameters.environment }}
+            appName: ${{ parameters.projectName }}
+            dockerImageName: ${{ parameters.imageName }}
+            acrUsername: ${{ parameters.acrUsername }}
+            ocpServer: ${{ parameters.ocpServer }}
+            ocpToken: ${{ parameters.ocpToken }}
+            ocpNamespace: ${{ parameters.ocpNamespace }}
+            rollbackToTag: ${{ parameters.rollbackToTag }}
+            rolloutTimeout: ${{ parameters.rolloutTimeout }}
+            allowUndoFallback: false
+

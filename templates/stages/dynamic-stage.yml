@@ -1,0 +1,42 @@
+# stages/dynamic-stage.yml
+parameters:
+  - name: stageName
+    type: string
+  - name: displayName
+    type: string
+  - name: dependsOn
+    type: object
+    default: []
+  - name: condition
+    type: string
+    default: "succeeded()"
+  - name: variables
+    type: object
+    default: {}
+  - name: jobTemplate
+    type: string
+  - name: jobParameters
+    type: object
+    default: {}
+  - name: lockBehavior
+    type: string
+    default: ''
+  - name: pool
+    type: object
+    default: {}
+
+stages:
+  - stage: ${{ parameters.stageName }}
+    displayName: ${{ parameters.displayName }}
+    ${{ if parameters.dependsOn }}:
+      dependsOn: ${{ parameters.dependsOn }}
+    condition: ${{ parameters.condition }}
+    ${{ if parameters.lockBehavior }}:
+      lockBehavior: ${{ parameters.lockBehavior }}
+    ${{ if parameters.pool }}:
+      pool: ${{ parameters.pool }}
+    ${{ if parameters.variables }}:
+      variables: ${{ parameters.variables }}
+    jobs:
+      - template: ${{ parameters.jobTemplate }}
+        parameters: ${{ parameters.jobParameters }}

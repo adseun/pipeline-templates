@@ -1,0 +1,81 @@
+# stages/deploy-to-instance-stage.yml
+#
+# Merged replacement for the three near-identical instance deploy stages:
+#   deploy-windows-instance-stage.yml                       (platform: windows)
+#   deploy-cronjob-window-services-to-instance-stage.yml    (platform: windows-worker)
+#
+# Those three differed only in the name of the rollback stage they wait on
+# during a hotfix run, and which deploy job they call. Both are now derived
+# from `platform`. Behaviour is otherwise unchanged.
+#
+# NOTE: the hotfix dependency chain below is preserved exactly as it was, and
+# it is still inverted -- `uat` waits on the rollback stage, which only runs
+# when DAST/QA FAILED, so the chain does not advance on the happy path.
+# See §1.1 of the correctness review. Fixing it here now fixes all three
+# platforms at once; that is a behavioural change and belongs in its own commit.
+
+parameters:
+  - name: platform
+    type: string
+    values:
+      - windows         # IIS on a Windows VM
+      - windows-worker  # Windows Service / Task Scheduler job
+
+  - name: target                # 'openshift', 'azure', 'aws'
+    type: string
+
+  - name: environment
+    type: string
+    values:
+      - dev
+      - uat
+      - pilot
+      - production
+      - dr
+
+  - name: deploymentParameters   # platform-specific parameters
+    type: object
+    default: {}
+
+  - name: environmentConfig
+    type: object
+    default: {}
+
+  - name: projectName
+    type: string
+    default: ''
+
+stages:
+  # Main deployment stage
+  - stage: Deploy_${{ parameters.environment }}
+    displayName: 'Deploy to ${{ parameters.environment }} (${{ parameters.target }})'
+    ${{ if startsWith(lower(variables['Build.SourceBranch']), 'refs/heads/hotfix/') }}:
+      ${{ if eq(parameters.environment, 'dev') }}:
+        dependsOn:
+          - Build_And_Security
+      ${{ if eq(parameters.environment, 'uat') }}:
+        dependsOn:
+          - ${{ if eq(parameters.platform, 'windows') }}:
+            - Rollback_IIS
+          - ${{ if eq(parameters.platform, 'windows-worker') }}:
+            - Rollback_CronJob_WindowsService
+      ${{ if eq(parameters.environment, 'pilot') }}:
+        dependsOn:
+          - Deploy_uat
+      ${{ if eq(parameters.environment, 'production') }}:
+        dependsOn:
+          - Deploy_pilot
+    ${{ else }}:
+      dependsOn:
+        - Build_And_Security
+    condition: succeeded()
+    variables:
+      # Load environment-specific configuration
+      ${{ each envVar in parameters.environmentConfig[parameters.environment] }}:
+        ${{ envVar.key }}: ${{ envVar.value }}
+    jobs:
+      - template: ../jobs/deploy-to-windows.yml
+        parameters:
+          ${{ each envVar in parameters.deploymentParameters }}:
+            ${{ envVar.key }}: ${{ envVar.value }}
+          environmentConfig: ${{ parameters.environmentConfig[parameters.environment] }}

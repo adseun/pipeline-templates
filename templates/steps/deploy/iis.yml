@@ -1,0 +1,307 @@
+# =====================================================================
+# deploy-steps-to-iis.yml (UNIVERSAL: frontend SPA + backend API on IIS)
+#
+# One template serves both app types. What differs is parameterized:
+#
+#   appType ('frontend' | 'backend') drives:
+#     - App pool managed runtime:
+#         frontend / .NET Core backend -> 'No Managed Code' ('')
+#         classic ASP.NET backend      -> override via
+#         managedRuntimeVersion: 'v4.0'
+#     - Warm-up: backends get extra first-request patience (JIT /
+#       startup) via healthCheckInitialDelaySeconds default.
+#
+#   healthCheckPath: '/' suits an SPA; pass '/health' or
+#     '/api/health' for APIs (an API may 404 on '/', which would
+#     falsely fail the gate and falsely trigger rollback).
+#
+#   customSubFolderForArtifact / customDestinationFolder: already
+#     present -- used to flatten/rename the nested folder that
+#     dotnet publish zips ('<ProjectName>/') and Angular builds
+#     ('browser/') produce.
+#
+# RESTORED: the auto-rollback branch of the health check step. The
+# previous copy exited 1 without rolling back, leaving the BROKEN
+# version live while claiming otherwise.
+#
+# WARNING for classic ASP.NET (VSBuild MSDeploy packages): a zip made
+# with /p:WebPublishMethod=Package is a Web Deploy package, NOT a
+# plain zip of site files -- Expand-Archive yields nested
+# 'Content/D_C/...' paths. Either deploy those with msdeploy.exe, or
+# have the build produce a plain zip (dotnet publish / archive task).
+# =====================================================================
+
+parameters:
+  - name: deployPath
+    type: string
+    default: 'D:\Applications\DevSecOpsUI'
+  - name: projectName
+    type: string
+    default: 'DevSecOpsUI'
+  - name: port
+    type: number
+    default: 8087
+  - name: appType                     # 'frontend' | 'backend'
+    type: string
+    default: 'frontend'
+  - name: managedRuntimeVersion       # '' = No Managed Code (SPA + .NET Core)
+    type: string                      # 'v4.0' = classic ASP.NET Framework
+    default: ''
+  - name: customSubFolderForArtifact
+    type: string
+    default: ''
+  - name: customDestinationFolder
+    type: string
+    default: ''
+  - name: backupRoot
+    type: string
+    default: 'D:\Applications\Backups'
+  - name: backupsToKeep
+    type: number
+    default: 5
+  - name: healthCheckPath             # '/' for SPA; '/health' for APIs
+    type: string
+    default: '/'
+  - name: healthCheckRetries
+    type: number
+    default: 6
+  - name: healthCheckDelaySeconds
+    type: number
+    default: 10
+  - name: healthCheckInitialDelaySeconds   # backend JIT/startup warm-up
+    type: number
+    default: 0
+
+steps:
+  # Download the 'drop' artifact
+  - download: current
+    artifact: drop
+    displayName: 'Download Build Artifacts'
+
+  # Validate artifact BEFORE we disturb the running site
+  - powershell: |
+      $dropPath = "$(Pipeline.Workspace)\drop"
+      if (!(Test-Path $dropPath) -or ((Get-ChildItem $dropPath -Recurse -File).Count -eq 0)) {
+          Write-Error "Artifact 'drop' is missing or empty. Aborting before touching the live site."
+          exit 1
+      }
+      Write-Host "Artifact validated: $((Get-ChildItem $dropPath -Recurse -File).Count) file(s)."
+    displayName: 'Validate Artifact'
+
+  # Stop app pool, backup, deploy, record manifest
+  - powershell: |
+      $ErrorActionPreference = 'Stop'
+      Import-Module WebAdministration
+
+      $targetDir   = "${{ parameters.deployPath }}"
+      $projectName = "${{ parameters.projectName }}"
+      $backupRoot  = "${{ parameters.backupRoot }}"
+      $backupDir   = Join-Path $backupRoot "$($projectName)_$(Build.BuildId)"
+      $manifest    = Join-Path $backupRoot "$projectName-deployment-history.json"
+      $dropPath    = "$(Pipeline.Workspace)\drop"
+
+      # --- Stop app pool so files aren't locked ---
+      # Matters for BOTH app types: backends lock DLLs outright, and
+      # even static files can be held open by IIS output caching.
+      if (Test-Path "IIS:\AppPools\$projectName") {
+          if ((Get-WebAppPoolState -Name $projectName).Value -ne 'Stopped') {
+              Write-Host "Stopping app pool '$projectName'..."
+              Stop-WebAppPool -Name $projectName
+              $tries = 0
+              while ((Get-WebAppPoolState -Name $projectName).Value -ne 'Stopped' -and $tries -lt 30) {
+                  Start-Sleep -Seconds 1; $tries++
+              }
+          }
+      }
+
+      # --- Ensure target dir exists; backup current contents ---
+      $hadPreviousVersion = $false
+      if (!(Test-Path $targetDir)) {
+          New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+      } elseif ((Get-ChildItem $targetDir).Count -gt 0) {
+          Write-Host "Backing up current site to: $backupDir"
+          New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+          Move-Item -Path "$targetDir\*" -Destination $backupDir -Force
+          $hadPreviousVersion = $true
+      }
+
+      # --- Deploy: unzip or copy ---
+      $zipFiles = Get-ChildItem -Path "$dropPath\*.zip" -ErrorAction SilentlyContinue
+      if ($zipFiles.Count -gt 0) {
+          foreach ($zip in $zipFiles) {
+              Write-Host "Extracting $($zip.Name) to $targetDir..."
+              Expand-Archive -Path $zip.FullName -DestinationPath $targetDir -Force
+          }
+      } else {
+          Write-Host "No zip files found, performing standard copy."
+          Copy-Item -Path "$dropPath\*" -Destination $targetDir -Recurse -Force
+      }
+
+      # --- Optional subfolder flatten/rename ---
+      # frontend: e.g. 'browser' (Angular 17+) ; backend: e.g. the
+      # '<ProjectName>' folder inside a dotnet publish zip.
+      $subFolder      = "${{ parameters.customSubFolderForArtifact }}"
+      $destFolderName = "${{ parameters.customDestinationFolder }}"
+      if (-not [string]::IsNullOrWhiteSpace($subFolder) -and -not [string]::IsNullOrWhiteSpace($destFolderName)) {
+          $nestedDir = Join-Path $targetDir $subFolder
+          if (Test-Path $nestedDir) {
+              Rename-Item -Path $nestedDir -NewName $destFolderName -Force
+              Write-Host "Renamed '$subFolder' -> '$destFolderName'."
+          } else {
+              Write-Warning "Configured subfolder '$subFolder' was not found inside $targetDir."
+          }
+      }
+
+      # --- Backend sanity: warn if no web.config landed at the root ---
+      if ("${{ parameters.appType }}" -eq "backend" -and !(Test-Path (Join-Path $targetDir 'web.config'))) {
+          Write-Warning "appType=backend but no web.config at $targetDir root. IIS cannot host the app; check zip structure / subfolder flattening."
+      }
+
+      # --- Record deployment in manifest (rollback reads this) ---
+      $history = @()
+      if (Test-Path $manifest) {
+          $history = @(Get-Content $manifest -Raw | ConvertFrom-Json)
+      }
+      $entry = [pscustomobject]@{
+          buildId    = "$(Build.BuildId)"
+          buildNumber= "$(Build.BuildNumber)"
+          deployedAt = (Get-Date).ToString('o')
+          backupPath = if ($hadPreviousVersion) { $backupDir } else { $null }
+          deployPath = $targetDir
+          appType    = "${{ parameters.appType }}"
+          status     = 'deployed'
+      }
+      $history = @($entry) + $history
+      $history | ConvertTo-Json -Depth 4 | Set-Content $manifest -Encoding UTF8
+      Write-Host "Manifest updated: $manifest"
+
+      # --- Prune old backups (keep newest N) ---
+      $keep = ${{ parameters.backupsToKeep }}
+      Get-ChildItem -Path $backupRoot -Directory -Filter "$($projectName)_*" |
+          Sort-Object CreationTime -Descending |
+          Select-Object -Skip $keep |
+          ForEach-Object {
+              Write-Host "Pruning old backup: $($_.FullName)"
+              Remove-Item $_.FullName -Recurse -Force
+          }
+    displayName: 'Stop Pool, Backup, Deploy, Record Manifest'
+
+  # Create/Update IIS site + app pool runtime, then start
+  - powershell: |
+      $ErrorActionPreference = 'Stop'
+      Import-Module WebAdministration
+      $siteName = "${{ parameters.projectName }}"
+      $path     = "${{ parameters.deployPath }}"
+      $port     = "${{ parameters.port }}"
+      $runtime  = "${{ parameters.managedRuntimeVersion }}"
+
+      if (!(Test-Path "IIS:\AppPools\$siteName")) {
+          New-WebAppPool -Name $siteName
+      }
+
+      # Runtime: '' (No Managed Code) is correct for SPAs AND for
+      # ASP.NET Core (which runs out-of-process via ANCM).
+      # 'v4.0' only for classic ASP.NET Framework apps.
+      Set-ItemProperty "IIS:\AppPools\$siteName" -Name managedRuntimeVersion -Value $runtime
+      Write-Host "App pool runtime set to '$(if ($runtime) { $runtime } else { 'No Managed Code' })'."
+
+      if (!(Test-Path "IIS:\Sites\$siteName")) {
+          New-Website -Name $siteName -PhysicalPath $path -Port $port -ApplicationPool $siteName
+          Write-Host "Site $siteName created on port $port"
+      } else {
+          Set-ItemProperty "IIS:\Sites\$siteName" -Name physicalPath -Value $path
+          if (!(Get-WebBinding -Name $siteName -Port $port)) {
+              New-WebBinding -Name $siteName -Port $port -Protocol http
+          }
+          Write-Host "Site $siteName updated."
+      }
+
+      if ((Get-WebAppPoolState -Name $siteName).Value -ne 'Started') {
+          Start-WebAppPool -Name $siteName
+      }
+      Start-Website -Name $siteName -ErrorAction SilentlyContinue
+      Write-Host "App pool and site started."
+    displayName: 'Create/Update IIS Site and Start Pool'
+
+  # Health check -- auto-rollback on failure (RESTORED)
+  - powershell: |
+      $ErrorActionPreference = 'Stop'
+      Import-Module WebAdministration
+
+      $projectName  = "${{ parameters.projectName }}"
+      $port         = "${{ parameters.port }}"
+      $hcPath       = "${{ parameters.healthCheckPath }}"
+      $retries      = ${{ parameters.healthCheckRetries }}
+      $delay        = ${{ parameters.healthCheckDelaySeconds }}
+      $initialDelay = ${{ parameters.healthCheckInitialDelaySeconds }}
+      $backupRoot   = "${{ parameters.backupRoot }}"
+      $targetDir    = "${{ parameters.deployPath }}"
+      $manifest     = Join-Path $backupRoot "$projectName-deployment-history.json"
+      $url          = "http://localhost:$port$hcPath"
+
+      # Backend warm-up: give JIT/startup a head start before probing
+      if ($initialDelay -gt 0) {
+          Write-Host "Waiting ${initialDelay}s before first probe (app warm-up)..."
+          Start-Sleep -Seconds $initialDelay
+      }
+
+      $healthy = $false
+      for ($i = 1; $i -le $retries; $i++) {
+          try {
+              $resp = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 15
+              if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 400) {
+                  Write-Host "Health check passed (HTTP $($resp.StatusCode)) on attempt $i."
+                  $healthy = $true
+                  break
+              }
+          } catch {
+              Write-Host "Attempt $i/$($retries): not healthy yet ($($_.Exception.Message))"
+          }
+          Start-Sleep -Seconds $delay
+      }
+
+      if ($healthy) {
+          $history = @(Get-Content $manifest -Raw | ConvertFrom-Json)
+          $history[0].status = 'healthy'
+          $history | ConvertTo-Json -Depth 4 | Set-Content $manifest -Encoding UTF8
+          echo "##vso[task.setvariable variable=ROLLBACK_PERFORMED;isOutput=true]false"
+          exit 0
+      }
+
+      # ----- AUTO-ROLLBACK -----
+      Write-Warning "Health check FAILED. Rolling back to previous version..."
+      echo "##vso[task.setvariable variable=ROLLBACK_PERFORMED;isOutput=true]true"
+
+      $history = @(Get-Content $manifest -Raw | ConvertFrom-Json)
+      $current = $history[0]
+
+      if (-not $current.backupPath -or !(Test-Path $current.backupPath)) {
+          Write-Error "No backup available to roll back to. Site left as-is; manual intervention required."
+          exit 1
+      }
+
+      Stop-WebAppPool -Name $projectName
+      $tries = 0
+      while ((Get-WebAppPoolState -Name $projectName).Value -ne 'Stopped' -and $tries -lt 30) {
+          Start-Sleep -Seconds 1; $tries++
+      }
+
+      Remove-Item -Path "$targetDir\*" -Recurse -Force
+      Copy-Item -Path "$($current.backupPath)\*" -Destination $targetDir -Recurse -Force
+
+      Start-WebAppPool -Name $projectName
+
+      $history[0].status = 'rolled-back'
+      $history | ConvertTo-Json -Depth 4 | Set-Content $manifest -Encoding UTF8
+
+      # Verify the rollback itself
+      Start-Sleep -Seconds $delay
+      try {
+          $resp = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 15
+          Write-Host "Rollback verified (HTTP $($resp.StatusCode)). Failing pipeline to signal the bad deploy."
+      } catch {
+          Write-Error "Rollback completed but site still unhealthy: $($_.Exception.Message)"
+      }
+      exit 1   # always fail the run so the bad build is flagged
+    displayName: 'Health Check (auto-rollback on failure)'
+    name: healthGate

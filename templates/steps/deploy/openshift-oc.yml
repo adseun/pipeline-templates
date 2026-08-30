@@ -1,0 +1,255 @@
+# =====================================================================
+# oc-deploy-steps-to-openshift.yml
+# =====================================================================
+
+parameters:
+  - name: appName
+    type: string
+  - name: targetEnvironment
+    type: string
+    default: dev
+  - name: dockerImageName
+    type: string
+  - name: imageTag
+    type: string
+    default: "$(Build.BuildId)"
+  - name: acrUsername
+    type: string
+  - name: acrPassword
+    type: string
+  - name: ocpServer
+    type: string
+  - name: ocpToken
+    type: string
+  - name: ocpNamespace
+    type: string
+  - name: k8sDirectory
+    type: string
+    default: "k8s"
+  - name: rolloutTimeout
+    type: string
+    default: "180s"
+
+steps:
+  # Checkout app repo
+  - checkout: self
+    clean: true
+    displayName: "Deploy — Checkout App Repo"
+
+  # Step 1: Authenticate + switch namespace 
+  - script: |
+      set -euo pipefail
+      oc login \
+        --token="$OCPTOKEN" \
+        --server=${{ parameters.ocpServer }} \
+        --insecure-skip-tls-verify
+      oc project ${{ parameters.ocpNamespace }}
+      echo "[DEPLOY] Authenticated; namespace: ${{ parameters.ocpNamespace }}"
+    displayName: "Deploy — Authenticate to OpenShift"
+    env:
+      OCPTOKEN: ${{ parameters.ocpToken }}
+
+  # Step 2: CAPTURE STATE
+  # Reads the image tag currently live in the cluster BEFORE we touch
+  # anything. This is the tag we roll back to if this deploy fails,
+  # and the value written to the variable group's rollback variable.
+  - script: |
+      set -euo pipefail
+      IMAGE_NAME_LOWER=$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')
+
+      CURRENT_IMAGE=$(oc get deployment/"$IMAGE_NAME_LOWER" \
+        --namespace=${{ parameters.ocpNamespace }} \
+        -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "")
+
+      if [ -n "$CURRENT_IMAGE" ]; then
+        CURRENT_TAG="${CURRENT_IMAGE##*:}"
+        echo "[CAPTURE] Currently deployed image : $CURRENT_IMAGE"
+        echo "[CAPTURE] Rollback candidate tag   : $CURRENT_TAG"
+      else
+        CURRENT_TAG="none"
+        echo "[CAPTURE] No existing deployment found (first deploy). No rollback target."
+      fi
+
+      echo "##vso[task.setvariable variable=ROLLBACK_IMMUTABLE_TAG]$CURRENT_TAG"
+      echo "##vso[task.setvariable variable=ROLLBACK_IMMUTABLE_TAG;isOutput=true]$CURRENT_TAG"
+    displayName: "Deploy — Capture Current State (rollback anchor)"
+    name: captureState
+    env:
+      OCPTOKEN: ${{ parameters.ocpToken }}
+      IMAGE_NAME: ${{ parameters.dockerImageName }}
+
+  # Step 3: Ensure ACR pull secret exists 
+  - script: |
+      set -euo pipefail
+      oc create secret docker-registry acr-$ENVIRONMENT-pull-secret \
+        --docker-server="$ACR_NAME" \
+        --docker-username="$ACR_USERNAME" \
+        --docker-password="$ACR_PASSWORD" \
+        --namespace=${{ parameters.ocpNamespace }} \
+        --dry-run=client -o yaml | oc apply -f -
+
+      oc secrets link default acr-$ENVIRONMENT-pull-secret \
+        --for=pull \
+        --namespace=${{ parameters.ocpNamespace }}
+
+      echo "[DEPLOY] ACR pull secret ensured."
+    displayName: "Deploy — Ensure ACR Pull Secret"
+    env:
+      OCPTOKEN: ${{ parameters.ocpToken }}
+      ACR_NAME: ${{ parameters.acrUsername }}.azurecr.io
+      ACR_USERNAME: ${{ parameters.acrUsername }}
+      ACR_PASSWORD: ${{ parameters.acrPassword }}
+      ENVIRONMENT: ${{ parameters.targetEnvironment }}
+
+  # Step 4: Substitute placeholders
+  - script: |
+      set -euo pipefail
+      if [ "$(isHotFix)" == "true" ]; then
+        IMMUTABLE_TAG="hotfix-$(Build.BuildId)"
+      elif [ "${{ parameters.targetEnvironment }}" == "dev" ]; then
+        IMMUTABLE_TAG="$(Build.BuildId)"
+      else
+        IMMUTABLE_TAG="$(IMMUTABLE_TAG)"
+      fi
+      IMAGE_LOWER=$(echo "$ACR_NAME/$IMAGE_NAME:$IMMUTABLE_TAG" | tr '[:upper:]' '[:lower:]')
+      IMAGE_NAME_LOWER=$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')
+      PULL_SECRET="acr-$ENVIRONMENT-pull-secret"
+
+      echo "[DEPLOY] Manifest directory : ${{ parameters.k8sDirectory }}/"
+      echo "[DEPLOY] Image              : ${IMAGE_LOWER}"
+
+      if [ ! -d "${{ parameters.k8sDirectory }}" ]; then
+        echo "[DEPLOY] ERROR: '${{ parameters.k8sDirectory }}/' not found in app repo."
+        exit 1
+      fi
+
+      find ${{ parameters.k8sDirectory }} -name "*.yaml" -exec \
+        sed -i \
+          -e "s|IMAGE_TAG|${IMAGE_LOWER}|g" \
+          -e "s|APP_NAMESPACE|${{ parameters.ocpNamespace }}|g" \
+          -e "s|APP_NAME|${IMAGE_NAME_LOWER}|g" \
+          -e "s|PULL_SECRET|${PULL_SECRET}|g" \
+        {} \;
+
+      echo "[DEPLOY] Placeholders substituted."
+      echo "##vso[task.setvariable variable=IMMUTABLE_TAG]$IMMUTABLE_TAG"
+      echo "##vso[task.setvariable variable=IMMUTABLE_TAG;isOutput=true]$IMMUTABLE_TAG"
+    displayName: "Deploy — Substitute Manifest Placeholders"
+    name: substitute
+    env:
+      OCPTOKEN: ${{ parameters.ocpToken }}
+      ACR_NAME: ${{ parameters.acrUsername }}.azurecr.io
+      IMAGE_NAME: ${{ parameters.dockerImageName }}
+      ENVIRONMENT: ${{ parameters.targetEnvironment }}
+
+  # Step 5: Apply, verify rollout, AUTO-ROLLBACK on failure
+  - script: |
+      set -uo pipefail   # no -e: rollout failure is handled explicitly
+      IMAGE_NAME_LOWER=$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')
+      NS="${{ parameters.ocpNamespace }}"
+
+      # apply must succeed or we stop here (nothing changed on failure)
+      if ! oc apply -f ${{ parameters.k8sDirectory }}/ --namespace="$NS"; then
+        echo "##vso[task.logissue type=error][DEPLOY] oc apply failed. Cluster may be unchanged; inspect the error above."
+        exit 1
+      fi
+
+      # Audit trail: make `oc rollout history` readable
+      oc annotate deployment/"$IMAGE_NAME_LOWER" \
+        kubernetes.io/change-cause="build=$(Build.BuildId) tag=$(IMMUTABLE_TAG) branch=$(Build.SourceBranchName)" \
+        --namespace="$NS" --overwrite
+
+      if oc rollout status deployment/"$IMAGE_NAME_LOWER" \
+           --namespace="$NS" --timeout=${{ parameters.rolloutTimeout }}; then
+        echo "[DEPLOY] Rollout complete."
+        exit 0
+      fi
+
+      # ----- AUTO-ROLLBACK -----
+      echo "##vso[task.setvariable variable=ROLLBACK_PERFORMED;isOutput=true]true"
+      echo "##vso[task.logissue type=warning][DEPLOY] Rollout failed/timed out. Rolling back..."
+      echo "[DEPLOY] Diagnostics before rollback:"
+      oc get pods --namespace="$NS" -l app="$IMAGE_NAME_LOWER" -o wide || true
+      oc get events --namespace="$NS" --sort-by=.lastTimestamp | tail -n 15 || true
+
+      oc rollout undo deployment/"$IMAGE_NAME_LOWER" --namespace="$NS"
+
+      if oc rollout status deployment/"$IMAGE_NAME_LOWER" \
+           --namespace="$NS" --timeout=${{ parameters.rolloutTimeout }}; then
+        echo "[DEPLOY] Auto-rollback succeeded; previous version is serving."
+      else
+        echo "##vso[task.logissue type=error][DEPLOY] Auto-rollback ALSO failed. Manual intervention required."
+      fi
+      exit 1   # always fail the run so the bad build is flagged
+    displayName: "Deploy — Apply, Verify Rollout, Auto-Rollback"
+    name: applyRollout
+    env:
+      OCPTOKEN: ${{ parameters.ocpToken }}
+      IMAGE_NAME: ${{ parameters.dockerImageName }}
+
+  # Step 6: Record deployed + rollback tags (On Success)
+  - task: AzureCLI@2
+    displayName: 'Record Deployed Tags in Variable Group (On Success)'
+    condition: succeeded()
+    inputs:
+      azureSubscription: '$(azureServiceConnection)'
+      scriptType: 'bash'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
+        set -euo pipefail
+        az extension add --name azure-devops --yes
+
+        # FIX: double quotes -- single quotes stored the literal string
+        NEW_VALUE="$(IMMUTABLE_TAG)"
+        OLD_VALUE="$(ROLLBACK_IMMUTABLE_TAG)"   # set by captureState step
+
+        VARIABLE_NAME="$(TARGET_VAR_NAME)"
+        ROLLBACK_VARIABLE_NAME="$(TARGET_ROLLBACK_VAR_NAME)"
+        DYNAMIC_GROUP_NAME="${{ parameters.appName }}-image-tags"
+
+        GROUP_ID=$(az pipelines variable-group list \
+          --project "$(System.TeamProject)" \
+          --query "[?name=='$DYNAMIC_GROUP_NAME'].id" \
+          --output tsv)
+
+        if [ -z "$GROUP_ID" ]; then
+          echo "Variable group '$DYNAMIC_GROUP_NAME' not found. Creating..."
+          GROUP_ID=$(az pipelines variable-group create \
+            --name "$DYNAMIC_GROUP_NAME" \
+            --project "$(System.TeamProject)" \
+            --variables "initialized=true" \
+            --query "id" --output tsv)
+        fi
+        echo "Using variable group ID: $GROUP_ID ($DYNAMIC_GROUP_NAME)"
+
+        upsert_var() {
+          local NAME="$1" VALUE="$2"
+          local EXISTS
+          EXISTS=$(az pipelines variable-group variable list \
+            --group-id "$GROUP_ID" \
+            --project "$(System.TeamProject)" \
+            --query "contains(keys(@), '$NAME')" \
+            --output tsv)
+          if [ "$EXISTS" != "true" ]; then
+            az pipelines variable-group variable create \
+              --group-id "$GROUP_ID" --name "$NAME" --value "$VALUE" \
+              --project "$(System.TeamProject)" --output none
+          else
+            az pipelines variable-group variable update \
+              --group-id "$GROUP_ID" --name "$NAME" --value "$VALUE" \
+              --project "$(System.TeamProject)" --output none
+          fi
+          echo "Saved $NAME=$VALUE"
+        }
+
+        upsert_var "$VARIABLE_NAME" "$NEW_VALUE"
+        # Only record a rollback target if one actually existed
+        if [ "$OLD_VALUE" != "none" ] && [ -n "$OLD_VALUE" ]; then
+          upsert_var "$ROLLBACK_VARIABLE_NAME" "$OLD_VALUE"
+        else
+          echo "First deploy -- no rollback tag recorded."
+        fi
+
+        echo "Variable group metadata saved."
+    env:
+      AZURE_DEVOPS_EXT_PAT: $(ADMIN_PAT)

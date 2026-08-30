@@ -1,0 +1,52 @@
+
+parameters:
+  # Language/stack, passed to the Snyk scan and the build steps
+  - name: BuildType
+    type: string
+
+  - name: IsLegacyCode
+    type: boolean
+    default: false
+
+  - name: pathToProjectBuildFile
+    type: string
+    default: ''
+
+  - name: programmingLanguage
+    type: string
+  
+  - name: projectName
+    type: string
+  
+  - name: javaVersion
+    type: string
+    default: '17'
+    
+  
+steps:
+  - checkout: self
+    displayName: 'Checkout Source Code'
+    clean: true
+
+  # SAST steps
+  - template: ../security/sast-snyk.yml
+    parameters:
+      BuildType: ${{ parameters.BuildType }}
+
+  - ${{ if eq(parameters.programmingLanguage, 'dotnet') }}:
+      - template: ../build/dotnet.yml
+        parameters: 
+          pathToProjectBuildFile: ${{ parameters.pathToProjectBuildFile }}
+
+  - ${{ if eq(parameters.programmingLanguage, 'java_gradle') }}:
+      - template: ../build/java-gradle.yml
+        parameters: 
+          javaVersion: ${{ parameters.javaVersion }}
+
+  
+  - ${{ if eq(parameters.programmingLanguage, 'java_maven') }}:
+      - template: ../build/java-maven.yml
+        parameters: 
+          javaVersion: ${{ parameters.javaVersion }}
+
+  

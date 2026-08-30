@@ -1,0 +1,38 @@
+parameters:
+  - name: qualysWebAppName
+    type: string
+    default: '411259951-Document Password Protection App (DevSecOps) Test'
+  
+  - name: qualysServiceConnection
+    type: string
+    default: 'Test_Qualys'
+
+steps:
+  - task: QualysWASConnector@10
+    displayName: 'Run Qualys Scan'
+    inputs:
+      webApplication: ${{ parameters.qualysWebAppName}}
+      scanType: 'VULNERABILITY'
+      failBySeverity1: true
+      sev1: '0'
+      failBySeverity2: true
+      sev2: '0'
+      failBySeverity3: true
+      sev3: '0'
+      failBySeverity4: true
+      sev4: '0'
+      failBySeverity5: true
+      sev5: '0'
+      failIfWasCouldNotScan: true
+      authenticationRecord: 'Use Default'
+      optionProfile: 'Other'
+      profileName: '845144' #'1011448'
+      dataCheckFrequency: '5'
+      waitTimeforScanResult: '60*3'
+      WasService: ${{ parameters.qualysServiceConnection }}
+      ${{ if in(lower(variables['Build.SourceBranchName']), 'dev') }}:
+        skipScanWait: true
+        pdfGeneration: false
+      ${{ else }}:
+        skipScanWait: false
+        pdfGeneration: true

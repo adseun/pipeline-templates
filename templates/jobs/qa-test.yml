@@ -1,0 +1,26 @@
+parameters:
+  - name: projectFolder
+    type: string
+  - name: poolName
+    type: string
+  - name: qaAzureProject
+    type: string
+  - name: qaRepoName
+    type: string
+    
+jobs:
+  - job: QA_Test
+    displayName: 'Run Automated Test in Browser Stack'
+    timeoutInMinutes: 60
+    ${{ if eq(parameters.poolName, '') }}:
+      pool:
+        vmImage: 'ubuntu-latest'
+    ${{ else }}:
+      pool:
+        name: ${{ parameters.poolName }}
+    steps:
+      - template: ../steps/test/browserstack-qa.yml
+        parameters:
+            projectFolder: ${{ parameters.projectFolder }}
+            qaAzureProject: ${{ parameters.qaAzureProject }}
+            qaRepoName: ${{ parameters. qaRepoName }}

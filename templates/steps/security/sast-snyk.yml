@@ -1,0 +1,49 @@
+parameters:
+  - name: BuildType # or stack
+    type: string
+
+steps:
+  - ${{ if eq(parameters.BuildType, 'dotnet') }}:
+    - task: DotNetCoreCLI@2
+      displayName: 'Restore NuGet Packages'
+      inputs:
+        command: 'restore'
+        projects: '**/*.csproj'
+
+  - ${{ if eq(parameters.BuildType, 'java_maven') }}:
+    - task: Maven@4
+      displayName: 'Maven Resolve Dependencies'
+      inputs:
+        mavenPomFile: 'pom.xml'
+        goals: 'dependency:resolve'
+
+  - ${{ if eq(parameters.BuildType, 'java_gradle') }}:
+    - task: Gradle@3
+      displayName: 'Gradle Resolve Dependencies'
+      inputs:
+        gradleWrapperFile: 'gradlew'
+        tasks: 'dependencies --no-daemon'
+
+  - task: SnykSecurityScan@1
+    displayName: 'Snyk SCA Scan'
+    inputs:
+      serviceConnectionEndpoint: '$(snykServiceConnection)'
+      testType: 'app'
+      monitorWhen: 'always'
+      failOnIssues: true
+      failOnThreshold: 'medium'
+      additionalArguments: '--all-projects' 
+  
+  - task: SnykSecurityScan@1
+    displayName: 'Snyk SAST Scan'
+    inputs:
+      serviceConnectionEndpoint: '$(snykServiceConnection)'
+      testType: 'code'
+      failOnIssues: true
+      additionalArguments: '--all-projects' 
+      failOnThreshold: 'medium'
+
+  - publish: $(Agent.TempDirectory)
+    artifact: snyk_results
+    displayName: 'Publish Snyk SCA & SAST Results'
+

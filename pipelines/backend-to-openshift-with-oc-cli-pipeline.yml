@@ -1,0 +1,582 @@
+variables:
+  - group: 'build-nonprod-vars' #BROWSERSTACK_USERNAME, BROWSERSTACK_ACCESS_KEY,NONPROD-ACR-PASSWORD, NONPROD-ACR-USERNAME, ADMIN-PAT, CONTAINER-SIGNING-KEYNAME, KEYVAULT-NAME, ACS-ENDPOINT, ACS-token
+  - group: 'build-prod-vars' # PROD-ACR-PASSWORD, PROD-ACR-USERNAME
+  - group: 'build-uat-vars' # UAT-ACR-PASSWORD, UAT-ACR-USERNAME
+  - group: 'build-dev-vars' # DEV-ACR-PASSWORD, DEV-ACR-USERNAME
+  - group: 'build-pilot-vars' # PILOT-ACR-PASSWORD, PILOT-ACR-USERNAME
+  - group: 'build-hotfix-vars' # HOTFIX-ACR-PASSWORD, HOTFIX-ACR-USERNAME
+  # - group: '${{parameters.projectName}}-image-tags' # ${{parameters.projectName}}-IMMUTABLE-TAG,  ${{parameters.projectName}}-ROLLBACK-IMMUTABLE-TAG
+  - group: 'deployment-metadata' # PR_NUMBER-$(BuildId), PREVIOUS_ROLLBACK_VAL, PREVIOUS_TAG_VAL, VG_ID
+  - group: ocp-nonprod-vars  # OCPNONPRODSERVER, OCPNONPRODTOKEN
+  - group: ocp-prod-vars     # OCPPRODSERVER, OCPPRODTOKEN, OCPDRTOKEN,  OCPDRSERVER
+  
+  - name: COSIGN_KEY_PASSWORD
+    value: ''
+
+  - name: ADMIN_PAT
+    value: '$(ADMIN-PAT)'
+
+
+  - ${{ if eq(lower(variables['Build.SourceBranchName']), 'dev') }}:
+    - name: sourceRegistryName
+      value: $(NONPROD-ACR-USERNAME)
+    - name: sourceRegistryPassword
+      value: $(NONPROD-ACR-PASSWORD)
+    - name: targetRegistryName
+      value: $(DEV-ACR-USERNAME)
+    - name: targetRegistryPassword
+      value: $(DEV-ACR-PASSWORD)
+    - name: deployToEnvironments
+      value: 'dev'  # JSON string that can be converted in a template
+    - name: OCPTOKEN
+      value: $(OCPNONPRODTOKEN)
+    - name: OCPSERVER
+      value: $(OCPNONPRODSERVER)
+    - name: azureServiceConnection
+      value: 'ARM-ServiceConnection'
+    - name: TARGET_VAR_NAME
+      value: "DEV_${{ parameters.imageName }}-IMMUTABLE-TAG"
+    - name: TARGET_ROLLBACK_VAR_NAME
+      value: "DEV_${{ parameters.imageName }}-ROLLBACK-IMMUTABLE-TAG"
+   
+    
+  - ${{ if eq(lower(variables['Build.SourceBranchName']), 'uat') }}:
+    - name: sourceRegistryName
+      value: $(DEV-ACR-USERNAME)
+    - name: sourceRegistryPassword
+      value: $(DEV-ACR-PASSWORD)
+    - name: targetRegistryName
+      value: $(UAT-ACR-USERNAME)
+    - name: targetRegistryPassword
+      value: $(UAT-ACR-PASSWORD)
+    - name: deployToEnvironments
+      value: 'uat'
+    - name: azureServiceConnection
+      value: 'ARM-ServiceConnection'
+    - name: TARGET_VAR_NAME
+      value: "DEV_${{ parameters.imageName }}-IMMUTABLE-TAG"
+    - name: TARGET_ROLLBACK_VAR_NAME
+      value: "DEV_${{ parameters.imageName }}-ROLLBACK-IMMUTABLE-TAG"
+   
+  
+  - ${{ if eq(lower(variables['Build.SourceBranchName']), 'pilot') }}:
+    - name: sourceRegistryName
+      value: $(UAT-ACR-USERNAME)
+    - name: sourceRegistryPassword
+      value: $(UAT-ACR-PASSWORD)
+    - name: targetRegistryName
+      value: $(PILOT-ACR-USERNAME)
+    - name: targetRegistryPassword
+      value: $(PILOT-ACR-PASSWORD)
+    - name: deployToEnvironments
+      value: 'pilot'
+    - name: azureServiceConnection
+      value: 'ARM-ServiceConnection'
+    - name: TARGET_VAR_NAME
+      value: "UAT_${{ parameters.imageName }}-IMMUTABLE-TAG"
+    - name: TARGET_ROLLBACK_VAR_NAME
+      value: "UAT_${{ parameters.imageName }}-ROLLBACK-IMMUTABLE-TAG"
+  
+  - ${{ if eq(lower(variables['Build.SourceBranchName']), 'production') }}:
+    - name: sourceRegistryName
+      value: $(PILOT-ACR-USERNAME)
+    - name: sourceRegistryPassword
+      value: $(PILOT-ACR-PASSWORD)
+    - name: targetRegistryName
+      value: $(PROD-ACR-USERNAME)
+    - name: targetRegistryPassword
+      value: $(PROD-ACR-PASSWORD)
+    - name: deployToEnvironments
+      value: 'production'
+    - name: azureServiceConnection
+      value: 'ARM-ServiceConnection'
+    - name: OCPDRTOKEN
+      value: $(OCPDRTOKEN)
+    - name: OCPDRSERVER
+      value: $(OCPDRSERVER)
+    - name: TARGET_VAR_NAME
+      value: "PILOT_${{ parameters.imageName }}-IMMUTABLE-TAG"
+    - name: TARGET_ROLLBACK_VAR_NAME
+      value: "PILOT_${{ parameters.imageName }}-ROLLBACK-IMMUTABLE-TAG"
+  
+  - ${{ if startsWith(lower(variables['Build.SourceBranch']), 'refs/heads/hotfix/') }}:
+    - name: sourceRegistryName
+      value: $(NONPROD-ACR-USERNAME)
+    - name: sourceRegistryPassword
+      value: $(NONPROD-ACR-PASSWORD)
+    - name: targetRegistryName
+      value: $(HOTFIX-ACR-USERNAME) 
+    - name: targetRegistryPassword
+      value: $(HOTFIX-ACR-PASSWORD)
+    - name: deployToEnvironments
+      value: 'dev,uat,pilot,production'
+    - name: azureServiceConnection
+      value: 'ARM-ServiceConnection'
+    - name: TARGET_VAR_NAME
+      value: "HOTFIX_${{ parameters.imageName }}-IMMUTABLE-TAG"
+    - name: TARGET_ROLLBACK_VAR_NAME
+      value: "HOTFIX_${{ parameters.imageName }}-ROLLBACK-IMMUTABLE-TAG"
+    - name: isHotFix
+      value: true
+
+
+  - name: VARIABLE_GROUP_ID
+    value: '${{ parameters.projectName }}-image-tags'
+    
+  - name: IMMUTABLE_TAG
+    value: $[ variables[variables['TARGET_VAR_NAME']] ]
+
+  - name: ROLLBACK_IMMUTABLE_TAG
+    value: $[ variables[variables['TARGET_ROLLBACK_VAR_NAME']] ]
+
+  - name: qualysServiceConnection
+    value: 'Test_Qualys'
+  
+  - name: snykServiceConnection
+    value: 'Test_Snyk2'
+   
+  - name: dastTool
+    value: 'qualys'
+  
+  - name: browserStackServiceConnection
+    value: 'Test_BrowserStack'
+
+parameters:
+  # ------ Docker Image Details -----
+  - name: imageName
+    type: string
+  - name: imageVersion
+    type: string
+    default: latest
+  - name: dockerFilePath # must be provided if dockerfile is not at the root of the folder
+    type: string
+    default: "$(Build.SourcesDirectory)/Dockerfile"
+
+  # ---------- Required project-specific parameters ----------
+  - name: projectName
+    type: string
+  
+  - name: pathToProjectBuildFile
+    type: string
+    default: ''
+
+  # ---------- Optional parameters with defaults ----------
+
+  - name: environmentConfig
+    type: object
+    default: 
+      dev:
+        environmentName: 'dev'
+        approvalTimeout: 3600
+        buildCommand: 'npm run build-dev'
+        poolName: 'AgentPool-DEV_UAT'
+      uat:
+        environmentName: 'uat'
+        buildCommand: 'npm run build-uat'
+        poolName: 'AgentPool-DEV_UAT'
+      pilot:
+        environmentName: 'pilot'
+        buildCommand: 'npm run build-pilot'
+        poolName: 'AgentPool-PROD'
+      production:
+        environmentName: 'production'
+        buildCommand: 'npm run build-prod'
+        poolName: 'AgentPool-PROD'
+      dr:
+        environmentName: 'dr'
+        buildCommand: 'npm run build-prod'
+        poolName: 'AgentPool-DR'
+
+  
+  # ---------- Build parameters ----------
+  - name: BuildType # or stack # Must specify
+    type: string
+    default: dotnet
+    values:
+      - dotnet
+      - java_gradle
+      - java_maven
+  
+  # ---------- Qualys parameters ----------
+  - name: qualysWebAppName # Must specify
+    type: string
+
+
+  # ----- C# / .NET parameters -----------
+  - name: buildConfiguration
+    type: string
+    default: Release
+    values:
+      - Debug
+      - Release
+
+  - name: dotnetVersion
+    type: string
+    default: "8.0.x"
+
+  - name: testProjectPath
+    type: string
+    default: "tests/**/*.csproj"
+
+  # ------ Java / Spring parameters -----
+  - name: javaVersion
+    type: string
+    default: "17"
+    values:
+      - "11"
+      - "17"
+      - "21"
+
+  - name: mavenGoals
+    type: string
+    default: "test"
+
+  # OpenShift parameters
+  - name: ocpNamespace
+    type: string
+    default: ""
+
+  - name: k8sDirectory
+    type: string
+    default: "templates/k8s"
+  
+  - name: qaRepoName
+    type: string
+    default: Plain_QA_Automation_Repo
+  - name: qaAzureProject
+    type: string
+    default: DevSecOps Transformation
+
+  - name: rollbackToTag          # empty = use variable group / rollout undo
+    type: string
+    default: ''
+  - name: rolloutTimeout
+    type: string
+    default: "180s"
+
+stages:
+  # --------------------------------------------------------------------
+  # Stage 1: Build Backend app + SAST Scan
+  # --------------------------------------------------------------------
+  - template: ../templates/stages/dynamic-stage.yml
+    parameters:
+      jobTemplate: ../jobs/build-scan-publish-backend.yml
+      jobParameters:
+        poolName: ''
+        programmingLanguage: ${{ parameters.BuildType }}
+        pathToProjectBuildFile : ${{ parameters.pathToProjectBuildFile }}
+        projectName: ${{ parameters.projectName }}
+        javaVersion: ${{ parameters.javaVersion }}
+
+        BuildType: ${{ parameters.BuildType }}
+      stageName: 'Build_And_Security'
+      displayName: 'Run SAST+SCA Scans, Test, Build and Publish Artifacts '
+
+#   --------------------------------------------------------------------
+#   Stage 2: Build and push container image to ACR : if dev or hotfix
+#   --------------------------------------------------------------------
+  - ${{ if or(eq(lower(variables['Build.SourceBranchName']), 'dev'), contains(lower(variables['Build.SourceBranch']), 'hotfix')) }}:
+    - template: ../templates/stages/dynamic-stage.yml
+      parameters:
+        jobTemplate: ../jobs/build-push-container-image.yml
+        jobParameters:
+          poolName: ''
+          sourceRegistryName: $(sourceRegistryName)
+          imageName: ${{ parameters.imageName }}
+          imageVersion: ${{ parameters.imageVersion }}
+          environment: ${{ lower(variables['Build.SourceBranchName']) }}
+          sourceRegistryPassword: $(sourceRegistryPassword)
+          dockerFilePath:  ${{ parameters.dockerFilePath }}
+          projectName: ${{ parameters.imageName }}
+        stageName: 'Build_Container_Image'
+        displayName: 'Build and Push Container to ACR'
+        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+        dependsOn: 
+          - Build_And_Security
+           
+  # --------------------------------------------------------------------
+  # Stage 3: Scan Image with RHACS and optionally sign the image in dev
+  # --------------------------------------------------------------------
+  - template: ../templates/stages/dynamic-stage.yml
+    parameters:
+      jobTemplate: ../jobs/scan-and-sign-containerised-image.yml
+      jobParameters:
+        # poolName: ''
+        poolName: ${{ parameters.environmentConfig[lower(variables['Build.SourceBranchName'])].poolName }}
+        imageName: ${{ parameters.imageName }}
+        imageVersion: ${{ parameters.imageVersion }}
+        sourceRegistryPassword:  $(sourceRegistryPassword)
+        sourceRegistryName: $(sourceRegistryName)
+        environment: ${{ lower(variables['Build.SourceBranchName']) }}
+      stageName: 'Scan_Sign_Container_Image'
+      displayName: 'Scan Container Image with RedHat Advanced Cluster Security (RHACS)'
+      dependsOn: 
+        - ${{ if or(eq(lower(variables['Build.SourceBranchName']), 'dev'), contains(lower(variables['Build.SourceBranch']), 'hotfix')) }}:
+          - Build_Container_Image
+        - ${{ if in(lower(variables['Build.SourceBranchName']), 'pilot', 'uat', 'production') }}:
+          - Build_And_Security
+      condition: |
+        and(
+          or(
+            succeeded('Build_Container_Image'),
+            succeeded('Build_And_Security')
+          ),
+          ne(variables['Build.Reason'], 'PullRequest')
+        )
+      variables:
+        ${{ if or(eq(lower(variables['Build.SourceBranchName']), 'dev'), contains(lower(variables['Build.SourceBranch']), 'hotfix')) }}:
+          CONSUMED_TAG: $[ stageDependencies.Build_Container_Image.Build_And_Push_Image.outputs['tagAndPush.IMMUTABLE_TAG'] ]
+          IMMUTABLE_TAG: $[ variables['CONSUMED_TAG'] ]
+        ${{ else }}:
+          IMMUTABLE_TAG: $[ variables['IMMUTABLE_TAG'] ]
+
+#   --------------------------------------------------------------------
+#   Stage 4:For Non-hotfix Promote to (dev, uat, pilot or production) container registry
+#           For Hotfix, Promote to hotfix container registry 
+#   --------------------------------------------------------------------
+  - template: ../templates/stages/dynamic-stage.yml
+    parameters:
+      jobTemplate: ../jobs/promote-container-image.yml 
+      jobParameters:
+        poolName: ''
+        sourceRegistryName: $(sourceRegistryName)
+        imageName: ${{ parameters.imageName }}
+        imageVersion: ${{ parameters.imageVersion }}
+        azureServiceConnection: $(azureServiceConnection)
+        targetRegistryName: $(targetRegistryName)
+        environment: ${{ lower(variables['Build.SourceBranchName']) }}
+      stageName: 'Promote_Container_Image'
+      displayName: Promote Container in Registry ${{ lower(variables['Build.SourceBranchName']) }}
+      dependsOn: 
+        - Scan_Sign_Container_Image
+      condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+        
+    
+  # --------------------------------------------------------------------
+  # Stage 5: Deploy to OpenShift
+  # --------------------------------------------------------------------
+  
+  - ${{ each env in split(variables.deployToEnvironments, ',')}}:
+    - ${{ if eq(variables['isHotFix'], 'true')}}:
+      - template: ../templates/stages/dynamic-stage.yml #maintains the promotion design
+        parameters:
+          jobTemplate: ../jobs/promote-container-image.yml 
+          jobParameters:
+            poolName: ''
+            sourceRegistryName: $(targetRegistryName) # From hotfix acr deploy to the various environments
+            imageName: ${{ parameters.imageName }}
+            imageVersion: ${{ parameters.imageVersion }}
+            azureServiceConnection: $(azureServiceConnection)
+            ${{ if eq(env, 'dev')}}:
+              targetRegistryName: $(DEV-ACR-USERNAME)
+            ${{ if eq(env, 'uat')}}:
+              targetRegistryName: $(UAT-ACR-USERNAME)
+            ${{ if eq(env, 'pilot')}}:
+              targetRegistryName: $(PILOT-ACR-USERNAME)
+            ${{ if eq(env, 'production')}}:
+              targetRegistryName: $(PROD-ACR-USERNAME)
+            environment: ${{ env }}
+          stageName: 'Promote_Container_Image_HotFix_${{ env }}'
+          displayName: 'Promote Container in Registry ${{env}}'
+          ${{ if eq(env, 'dev')}}:
+            dependsOn: 
+              - Promote_Container_Image
+          ${{ if eq(env, 'uat')}}:
+            dependsOn: 
+              - 'QA_Test'
+          ${{ if eq(env, 'pilot')}}:
+            dependsOn: 
+              - Deploy_uat
+          ${{ if eq(env, 'production')}}:
+            dependsOn: 
+              - Deploy_pilot
+          condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+
+    - template: ../templates/stages/deploy-openshift-stage.yml
+      parameters:
+        buildJobTemplate: ../jobs/deploy-to-openshift-using-oc-cli.yml
+        buildJobParameters:
+          target: 'OpenShift'
+          projectName: ${{ coalesce(parameters.projectName, variables['Build.Repository.Name']) }}
+          environment: ${{ env }}
+          environmentConfig: ${{ parameters.environmentConfig[env] }}
+
+          # imageRepository: '$(targetRegistryName).azurecr.io/${{ parameters.imageName }}'
+        deploymentParameters:
+          dockerImageName: ${{ parameters.dockerImageName }}
+          imageTag: ${{ coalesce(variables['IMMUTABLE_TAG'], parameters.imageVersion, variables['Build.BuildId']) }}
+          acrUsername: $(targetRegistryName)
+          acrPassword: $(targetRegistryPassword)
+          ${{ if eq(env, 'dev') }}:
+            ocpServer: $(OCPNONPRODSERVER)
+            ocpToken: $(OCPNONPRODTOKEN)
+          ${{ if eq(env, 'uat') }}:
+            ocpServer: $(OCPNONPRODSERVER)
+            ocpToken: $(OCPNONPRODTOKEN)
+          ${{ if eq(env, 'pilot') }}:
+            ocpServer: $(OCPPRODSERVER)
+            ocpToken: $(OCPPRODTOKEN) 
+          ${{ if eq(env, 'production') }}:
+            ocpServer: $(OCPPRODSERVER)
+            ocpToken: $(OCPPRODTOKEN) 
+          ocpNamespace: ${{ parameters.ocpNamespace }}
+          k8sDirectory: ${{ parameters.k8sDirectory }}
+          # poolName: ''
+          poolName: ${{ parameters.environmentConfig[env].poolName }}
+          targetEnvironment: ${{ env }}
+
+     #  Run dast & qa scan once after the first deployment to dev environment when it is an hotfix
+    - ${{ if and(eq(variables['isHotFix'], 'true'), eq(env, 'dev')) }}:
+      - template: ../templates/stages/dynamic-stage.yml
+        parameters:
+          jobTemplate: ../jobs/dast-scan.yml
+          jobParameters:
+            poolName: ''
+            qualysWebAppName: ${{ parameters.qualysWebAppName }}
+            qualysServiceConnection: $(qualysServiceConnection)
+            dastTool: $(dastTool)
+            environment: ${{ env }}
+          stageName: DAST_${{ env }}
+          displayName: 'Dynamic Application Security Scanning with Qualys'
+          dependsOn: 
+            - Deploy_${{ env }}
+          condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+
+      - template: ../templates/stages/dynamic-stage.yml
+        parameters:
+          jobTemplate: ../jobs/qa-test.yml
+          jobParameters:
+            # projectFolder: ${{ coalesce(parameters.projectName, variables['Build.Repository.Name']) }}
+            projectFolder: ''
+            qaAzureProject: ${{parameters.qaAzureProject}}
+            qaRepoName: ${{parameters.qaRepoName}}
+            poolName: ${{ parameters.environmentConfig[env].poolName }}
+            # poolName: ''
+          stageName: 'QA_Test'
+          displayName: 'Run QA test with Browserstack'
+          condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+          dependsOn: 
+           - DAST_${{ env }}
+      
+      - template: ../templates/stages/dynamic-stage.yml
+        parameters:
+          jobTemplate: ../jobs/rollback-oc-cli-deployment.yml
+          jobParameters:
+            environment: ${{ lower(variables['Build.SourceBranchName']) }}
+            projectName: ${{ coalesce(parameters.projectName, variables['Build.Repository.Name']) }}
+            imageName: ${{ parameters.imageName }}
+            acrUsername: $(targetRegistryName)
+            ocpServer: $(OCPSERVER)
+            ocpToken: $(OCPTOKEN)
+            ocpNamespace: ${{ parameters.ocpNamespace }}
+            poolName: ${{ parameters.environmentConfig[lower(variables['Build.SourceBranchName'])].poolName }}
+            rollbackToTag: ${{ parameters.rollbackToTag }}
+            rolloutTimeout: ${{ parameters.rolloutTimeout }}
+          stageName: 'Rollback_Openshift'
+          displayName: 'Rollback OpenShift Deployments'
+          dependsOn: 
+            - Deploy_production
+          condition: >
+            and(
+              eq(dependencies.Deploy_${{ env }}.result, 'Succeeded'),
+              or(eq(dependencies.DAST_${{ env }}.result, 'Failed'), eq(dependencies.QA_Test.result, 'Failed')),
+              ne(dependencies.Deploy_${{ env }}.outputs['OpenShiftDeployment.applyRollout.ROLLBACK_PERFORMED'], 'true')
+            )
+          
+      
+  # --------------------------------------------------------------------
+  # Stage 6: Dynamic Security Scanning with DAST: non-hotfix
+  # --------------------------------------------------------------------
+  - ${{ if ne(variables['isHotFix'], 'true') }}:
+    - template: ../templates/stages/dynamic-stage.yml
+      parameters:
+        jobTemplate: ../jobs/dast-scan.yml
+        dependsOn: 
+          - Deploy_${{ lower(variables['Build.SourceBranchName']) }}
+        condition: "succeeded()"
+        jobParameters:
+          poolName: ''
+          qualysWebAppName: ${{ parameters.qualysWebAppName }}
+          qualysServiceConnection: $(qualysServiceConnection)
+          dastTool: $(dastTool)
+          environment: ${{ lower(variables['Build.SourceBranchName']) }}
+        stageName: DAST_${{ lower(variables['Build.SourceBranchName']) }}
+        displayName: 'Dynamic Application Security Scanning with Qualys'
+
+  # --------------------------------------------------------------------
+  # Stage 7: QA Test Stage: non-hotfix
+  # --------------------------------------------------------------------
+  - ${{ if ne(variables['isHotFix'], 'true') }}:
+    - template: ../templates/stages/dynamic-stage.yml
+      parameters:
+        jobTemplate: ../jobs/qa-test.yml
+        dependsOn: 
+          - DAST_${{ lower(variables['Build.SourceBranchName']) }}
+        condition: "succeeded()"
+        jobParameters:
+          projectFolder: ${{ coalesce(parameters.projectName, variables['Build.Repository.Name']) }}
+          qaAzureProject: ${{ parameters.qaAzureProject }}
+          qaRepoName: ${{ parameters.qaRepoName }}
+          # poolName: ''
+          poolName: ${{ parameters.environmentConfig[lower(variables['Build.SourceBranchName'])].poolName }}
+        stageName: 'QA_Test'
+        displayName: 'Run QA test with Browserstack'
+      
+  
+  # --------------------------------------------------------------------
+  # Stage 8: Rollback Stage
+  # --------------------------------------------------------------------
+  - ${{ if ne(variables['isHotFix'], 'true') }}:
+    - template: ../templates/stages/dynamic-stage.yml
+      parameters:
+        jobTemplate: ../jobs/rollback-oc-cli-deployment.yml
+        jobParameters:
+          environment: ${{ lower(variables['Build.SourceBranchName']) }}
+          projectName: ${{ coalesce(parameters.projectName, variables['Build.Repository.Name']) }}
+          imageName: ${{ parameters.imageName }}
+          acrUsername: $(targetRegistryName)
+          ocpServer: $(OCPSERVER)
+          ocpToken: $(OCPTOKEN)
+          ocpNamespace: ${{ parameters.ocpNamespace }}
+          poolName: ${{ parameters.environmentConfig[lower(variables['Build.SourceBranchName'])].poolName }}
+          rollbackToTag: ${{ parameters.rollbackToTag }}
+          rolloutTimeout: ${{ parameters.rolloutTimeout }}
+        stageName: 'Rollback_Openshift'
+        displayName: 'Rollback OpenShift Deployments'
+        dependsOn: 
+          - 'QA_Test'
+        condition: >
+          and(
+            eq(dependencies.Deploy_${{ lower(variables['Build.SourceBranchName']) }}.result, 'Succeeded'),
+            or(eq(dependencies.DAST_${{ lower(variables['Build.SourceBranchName']) }}.result, 'Failed'), eq(dependencies.QA_Test.result, 'Failed')),
+            ne(dependencies.Deploy_${{ lower(variables['Build.SourceBranchName']) }}.outputs['OpenShiftDeployment.applyRollout.ROLLBACK_PERFORMED'], 'true')
+          )
+    
+  # --------------------------------------------------------------------
+  # Stage 9: Deploy to DR when deployment to production is successful
+  # --------------------------------------------------------------------
+  - ${{ if eq(lower(variables['Build.SourceBranchName']), 'production') }}:
+    - template: ../templates/stages/deploy-openshift-stage.yml
+      parameters:
+        buildJobTemplate: ../jobs/deploy-to-openshift-using-oc-cli.yml
+        buildJobParameters:
+          target: 'OpenShift'
+          projectName: ${{ coalesce(parameters.projectName, variables['Build.Repository.Name']) }}
+          environment: ${{ 'dr' }}
+          environmentConfig: ${{ parameters.environmentConfig['dr'] }}
+
+            # imageRepository: '$(targetRegistryName).azurecr.io/${{ parameters.imageName }}'
+        deploymentParameters:
+          dockerImageName: ${{ parameters.dockerImageName }}
+          imageTag: ${{ coalesce(variables['IMMUTABLE_TAG'], parameters.imageVersion, variables['Build.BuildId']) }}
+          acrUsername: $(targetRegistryName)
+          acrPassword: $(targetRegistryPassword)
+          ocpServer: $(OCPDRSERVER)
+          ocpToken: $(OCPDRTOKEN)
+          ocpNamespace: ${{ parameters.ocpNamespace }}
+          k8sDirectory: ${{ parameters.k8sDirectory }}
+          poolName: ${{ parameters.environmentConfig['dr'].poolName }}
+          # poolName: ''
+
+           
+           

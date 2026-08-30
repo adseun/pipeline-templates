@@ -1,0 +1,75 @@
+parameters:
+  - name: sourceRegistryName
+    type: string
+  - name: targetRegistryName
+    type: string
+  - name: imageName
+    type: string
+  - name: imageVersion
+    type: string
+    default: latest
+  - name: environment
+    type: string
+    default: 'dev'
+  - name: azureServiceConnection
+    type: string
+    default: 'ARM-ServiceConnection'
+  # Remove forceImport parameter entirely
+
+
+
+steps:
+  - task: AzureCLI@2
+    displayName: 'Promote Container Image using ACR Import'
+    inputs:
+      azureSubscription: ${{ parameters.azureServiceConnection }}
+      scriptType: 'bash'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
+        set -e
+        
+        # variables
+        # Checks if environment is dev OR if global isHotfix variable is true
+        if [ "$(isHotFix)" == "true" ]; then
+          IMMUTABLE_TAG="hotfix-$(Build.BuildId)"
+        elif [ "${{ parameters.environment }}" == "dev" ]; then
+          IMMUTABLE_TAG="$(Build.BuildId)"
+        else
+          IMMUTABLE_TAG="$(IMMUTABLE_TAG)"  
+        fi
+
+        echo "Using tag: $IMMUTABLE_TAG"
+        SOURCE_REG="${{ parameters.sourceRegistryName }}.azurecr.io"
+        TARGET_REG="${{ parameters.targetRegistryName }}.azurecr.io"
+        IMAGE="${{ parameters.imageName }}"
+        DATESTAMP=$(date +%d%m%Y)
+        SOURCE_FULL="$SOURCE_REG/$IMAGE:$IMMUTABLE_TAG"
+        
+        echo "Promoting $SOURCE_FULL to $TARGET_REG"
+        
+        # Function to perform import with retry logic
+        import_image() {
+          local source="$1"
+          local target="$2"
+          
+          az acr import \
+            --name "${{ parameters.targetRegistryName }}" \
+            --source "$source" \
+            --image "$target" \
+            --force \
+            --output none
+          
+          echo "✓ Imported: $source -> $target"
+        }
+        
+        # Import with immutable tag
+        import_image "$SOURCE_FULL" "$IMAGE:$IMMUTABLE_TAG"
+        
+        # Import with environment tag
+        import_image "$SOURCE_FULL" "$IMAGE:${{ parameters.environment }}"
+        
+        # Import with datestamp tag
+        import_image "$SOURCE_FULL" "$IMAGE:$DATESTAMP"
+        
+        echo "All images promoted successfully!"
+        

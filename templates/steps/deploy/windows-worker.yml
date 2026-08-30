@@ -1,0 +1,326 @@
+# =====================================================================
+# deploy-steps-to-windows-services-or-task-scheduler.yml
+# For Windows Services and Scheduled Tasks (cron jobs)
+#
+# Key upgrades
+#   1. Manifest (deployment-history.json) records every deploy --
+#      buildId, backup path, binPath, status -- same pattern as the
+#      IIS template, so rollback never guesses folder names.
+#   2. STABILITY check replaces the single 5s status peek. A service
+#      in a crash loop passes "Status -eq Running at t+5s" -- worse,
+#      your sc.exe failure auto-restart actively masks crashes. The
+#      new check polls over a window and verifies the PID has not
+#      changed (a changed PID = it crashed and recovery restarted it).
+#   3. AUTO-ROLLBACK: if stability fails, restore the backup taken
+#      moments ago, restart, re-verify, fail the run. Original just
+#      exit 1'd and left the broken version installed.
+#   4. binPath is UPDATED on existing services (sc.exe config).
+#      Original only set binPath at creation -- if the exe name or
+#      folder ever changes between versions (or during rollback),
+#      the service kept launching the old path.
+#   5. CronJob verification is real: optionally trigger the task once
+#      and check LastTaskResult, instead of "enabled = healthy".
+#   6. Backup pruning (keep newest N), and backup taken only after
+#      artifact validation.
+# =====================================================================
+
+parameters:
+  - name: deployPath
+    type: string
+    default: 'D:\Applications\DevSecOpsWorker'
+  - name: projectName            # service name or task name
+    type: string
+    default: 'DevSecOpsWorker'
+  - name: customSubFolderForArtifact
+    type: string
+    default: ''
+  - name: customDestinationFolder
+    type: string
+    default: ''
+  - name: deploymentType
+    type: string
+    default: 'WindowsService'
+    values: ['WindowsService', 'CronJob']
+  - name: binaryPath
+    type: string
+  - name: cronSchedule
+    type: string
+    default: ''
+  - name: runAsUser
+    type: string
+    default: ''
+  - name: backupRoot
+    type: string
+    default: 'D:\Applications\Backups'
+  - name: backupsToKeep
+    type: number
+    default: 5
+  - name: stabilitySeconds       # service must stay up this long
+    type: number
+    default: 30
+  - name: runTaskOnDeploy        # CronJob: trigger once to verify
+    type: boolean
+    default: false
+
+steps:
+  - download: current
+    artifact: drop
+    displayName: 'Download Build Artifacts'
+
+  # Validate artifact BEFORE stopping anything
+  - powershell: |
+      $dropPath = "$(Pipeline.Workspace)\drop"
+      if (!(Test-Path $dropPath) -or ((Get-ChildItem $dropPath -Recurse -File).Count -eq 0)) {
+          Write-Error "Artifact 'drop' is missing or empty. Aborting before touching the live service."
+          exit 1
+      }
+      Write-Host "Artifact validated: $((Get-ChildItem $dropPath -Recurse -File).Count) file(s)."
+    displayName: 'Validate Artifact'
+
+  # Stop service/task and free locks (original logic, kept)
+  - powershell: |
+      $type = "${{ parameters.deploymentType }}"
+      $name = "${{ parameters.projectName }}"
+
+      if ($type -eq "WindowsService") {
+          if (Get-Service -Name $name -ErrorAction SilentlyContinue) {
+              Write-Host "Stopping Windows Service: $name..."
+              Stop-Service -Name $name -Force -WarningAction SilentlyContinue
+              $retry = 0
+              while ((Get-Service -Name $name).Status -ne 'Stopped' -and $retry -lt 10) {
+                  Start-Sleep -Seconds 2; $retry++
+              }
+              if ((Get-Service -Name $name).Status -ne 'Stopped') {
+                  Write-Warning "Service failed to stop gracefully. Forcing process termination..."
+                  $servicePid = (Get-CimInstance Win32_Service -Filter "Name='$name'").ProcessId
+                  if ($servicePid) { Stop-Process -Id $servicePid -Force -ErrorAction SilentlyContinue }
+              }
+          }
+      } elseif ($type -eq "CronJob") {
+          $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+          if ($task) {
+              Write-Host "Disabling and stopping Scheduled Task: $name..."
+              Disable-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+              Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+          }
+      }
+    displayName: 'Stop and Free Existing Locks'
+
+  # Backup, deploy, record manifest, prune
+  - powershell: |
+      $ErrorActionPreference = 'Stop'
+      $targetDir  = "${{ parameters.deployPath }}"
+      $project    = "${{ parameters.projectName }}"
+      $backupRoot = "${{ parameters.backupRoot }}"
+      $backupDir  = Join-Path $backupRoot "$($project)_$(Build.BuildId)"
+      $manifest   = Join-Path $backupRoot "$project-deployment-history.json"
+      $dropPath   = "$(Pipeline.Workspace)\drop"
+
+      $hadPreviousVersion = $false
+      if (!(Test-Path $targetDir)) {
+          New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+      } elseif ((Get-ChildItem $targetDir).Count -gt 0) {
+          Write-Host "Backing up existing files to: $backupDir"
+          New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+          Copy-Item -Path "$targetDir\*" -Destination $backupDir -Recurse -Force
+          Remove-Item -Path "$targetDir\*" -Recurse -Force
+          $hadPreviousVersion = $true
+      }
+
+      $zipFiles = Get-ChildItem -Path "$dropPath\*.zip" -ErrorAction SilentlyContinue
+      if ($zipFiles.Count -gt 0) {
+          foreach ($zip in $zipFiles) {
+              Write-Host "Extracting $($zip.Name) to $targetDir..."
+              Expand-Archive -Path $zip.FullName -DestinationPath $targetDir -Force
+          }
+      } else {
+          Write-Host "No zip package detected. Performing linear copy..."
+          Copy-Item -Path "$dropPath\*" -Destination $targetDir -Recurse -Force
+      }
+
+      $subFolder      = "${{ parameters.customSubFolderForArtifact }}"
+      $destFolderName = "${{ parameters.customDestinationFolder }}"
+      if (-not [string]::IsNullOrWhiteSpace($subFolder) -and -not [string]::IsNullOrWhiteSpace($destFolderName)) {
+          $nestedDir = Join-Path $targetDir $subFolder
+          if (Test-Path $nestedDir) {
+              Rename-Item -Path $nestedDir -NewName $destFolderName -Force
+          } else {
+              Write-Warning "Subfolder '$subFolder' was provided but not found inside $targetDir."
+          }
+      }
+
+      # Deployed binary must actually exist, or the service can never start
+      $binPath = "${{ parameters.binaryPath }}"
+      $exeOnly = ($binPath -split '\s+')[0].Trim('"')
+      if (!(Test-Path $exeOnly)) {
+          Write-Error "Configured binary '$exeOnly' does not exist after deploy. Check artifact structure / binaryPath."
+          exit 1
+      }
+
+      # --- Manifest ---
+      $history = @()
+      if (Test-Path $manifest) { $history = @(Get-Content $manifest -Raw | ConvertFrom-Json) }
+      $entry = [pscustomobject]@{
+          buildId        = "$(Build.BuildId)"
+          buildNumber    = "$(Build.BuildNumber)"
+          deployedAt     = (Get-Date).ToString('o')
+          backupPath     = if ($hadPreviousVersion) { $backupDir } else { $null }
+          deployPath     = $targetDir
+          binaryPath     = $binPath
+          deploymentType = "${{ parameters.deploymentType }}"
+          status         = 'deployed'
+      }
+      $history = @($entry) + $history
+      $history | ConvertTo-Json -Depth 4 | Set-Content $manifest -Encoding UTF8
+
+      # --- Prune (never prune what we just created) ---
+      $keep = ${{ parameters.backupsToKeep }}
+      Get-ChildItem -Path $backupRoot -Directory -Filter "$($project)_*" |
+          Sort-Object CreationTime -Descending |
+          Select-Object -Skip $keep |
+          ForEach-Object { Write-Host "Pruning: $($_.FullName)"; Remove-Item $_.FullName -Recurse -Force }
+    displayName: 'Backup, Deploy, Record Manifest'
+
+  # Idempotent registration -- now also UPDATES binPath on existing hosts
+  - powershell: |
+      $ErrorActionPreference = 'Stop'
+      $type     = "${{ parameters.deploymentType }}"
+      $name     = "${{ parameters.projectName }}"
+      $binPath  = "${{ parameters.binaryPath }}"
+      $user     = "${{ parameters.runAsUser }}"
+      $schedule = "${{ parameters.cronSchedule }}"
+
+      if ($type -eq "WindowsService") {
+          $service = Get-Service -Name $name -ErrorAction SilentlyContinue
+          if (-not $service) {
+              Write-Host "Registering new Windows Service '$name'..."
+              New-Service -Name $name -BinaryPathName $binPath -DisplayName $name `
+                          -StartupType Automatic `
+                          -Description "Managed by Azure DevOps Pipeline - $name"
+              sc.exe failure $name reset= 86400 actions= restart/60000/restart/60000/restart/60000 | Out-Null
+          } else {
+              Write-Host "Service '$name' exists. Enforcing StartupType and current binPath..."
+              Set-Service -Name $name -StartupType Automatic
+              # FIX: keep registration in sync with this deploy's binary.
+              # Also what makes ROLLBACK correct if paths differ per version.
+              sc.exe config $name binPath= "$binPath" | Out-Null
+          }
+      } elseif ($type -eq "CronJob") {
+          $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+          $action = New-ScheduledTaskAction -Execute $binPath `
+                        -WorkingDirectory (Split-Path $binPath -Parent)
+          if (-not $task) {
+              Write-Host "Registering Scheduled Task '$name'..."
+              $trigger  = New-ScheduledTaskTrigger -Daily -At $schedule
+              $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
+                            -DontStopIfGoingOnBatteries `
+                            -ExecutionTimeLimit (New-TimeSpan -Days 3)
+              Register-ScheduledTask -TaskName $name -Trigger $trigger -Action $action `
+                                     -Settings $settings -User $user -Force
+          } else {
+              # FIX: refresh the action so the task always points at
+              # this deploy's binary/working dir (and rollback's).
+              Set-ScheduledTask -TaskName $name -Action $action | Out-Null
+              Write-Host "Scheduled Task exists; action refreshed to current binary."
+          }
+      }
+    displayName: 'Ensure Service/Task Host Registration'
+
+  # Start + STABILITY gate -- auto-rollback on failure
+  - powershell: |
+      $ErrorActionPreference = 'Stop'
+      $type       = "${{ parameters.deploymentType }}"
+      $name       = "${{ parameters.projectName }}"
+      $project    = "${{ parameters.projectName }}"
+      $targetDir  = "${{ parameters.deployPath }}"
+      $backupRoot = "${{ parameters.backupRoot }}"
+      $manifest   = Join-Path $backupRoot "$project-deployment-history.json"
+      $stabilitySeconds = ${{ parameters.stabilitySeconds }}
+
+      function Test-Health {
+          param($type, $name, $stabilitySeconds)
+          if ($type -eq "WindowsService") {
+              Start-Service -Name $name -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds 5
+              $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+              if (-not $svc -or $svc.Status -ne 'Running') { return $false }
+
+              # Stability: same PID for the whole window. A PID change
+              # means it crashed and sc.exe recovery restarted it --
+              # 'Running' at any instant would have hidden that.
+              $pid0 = (Get-CimInstance Win32_Service -Filter "Name='$name'").ProcessId
+              if (-not $pid0) { return $false }
+              $elapsed = 0
+              while ($elapsed -lt $stabilitySeconds) {
+                  Start-Sleep -Seconds 5; $elapsed += 5
+                  $svc  = Get-Service -Name $name
+                  $pidN = (Get-CimInstance Win32_Service -Filter "Name='$name'").ProcessId
+                  if ($svc.Status -ne 'Running' -or $pidN -ne $pid0) {
+                      Write-Warning "Instability: status=$($svc.Status), pid $pid0 -> $pidN (crash/restart detected)."
+                      return $false
+                  }
+              }
+              return $true
+          } else {
+              Enable-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+              if ("${{ parameters.runTaskOnDeploy }}" -in @("True","true")) {
+                  Write-Host "Triggering task once to verify..."
+                  Start-ScheduledTask -TaskName $name
+                  $elapsed = 0
+                  do {
+                      Start-Sleep -Seconds 5; $elapsed += 5
+                      $state = (Get-ScheduledTask -TaskName $name).State
+                  } while ($state -eq 'Running' -and $elapsed -lt 300)
+                  $result = (Get-ScheduledTaskInfo -TaskName $name).LastTaskResult
+                  Write-Host "Task LastTaskResult: $result"
+                  return ($result -eq 0)
+              }
+              return $true   # enabled + registered is the best passive signal
+          }
+      }
+
+      if (Test-Health $type $name $stabilitySeconds) {
+          Write-Host "Deployment healthy and stable."
+          $history = @(Get-Content $manifest -Raw | ConvertFrom-Json)
+          $history[0].status = 'healthy'
+          $history | ConvertTo-Json -Depth 4 | Set-Content $manifest -Encoding UTF8
+          echo "##vso[task.setvariable variable=ROLLBACK_PERFORMED;isOutput=true]false"
+          exit 0
+      }
+
+      # ----- AUTO-ROLLBACK -----
+      Write-Warning "Health/stability FAILED. Rolling back to previous version..."
+      echo "##vso[task.setvariable variable=ROLLBACK_PERFORMED;isOutput=true]true"
+
+      $history = @(Get-Content $manifest -Raw | ConvertFrom-Json)
+      $current = $history[0]
+      if (-not $current.backupPath -or !(Test-Path $current.backupPath)) {
+          Write-Error "No backup available to roll back to. Manual intervention required."
+          exit 1
+      }
+
+      if ($type -eq "WindowsService") {
+          Stop-Service -Name $name -Force -ErrorAction SilentlyContinue
+          $retry = 0
+          while ((Get-Service -Name $name).Status -ne 'Stopped' -and $retry -lt 10) {
+              Start-Sleep -Seconds 2; $retry++
+          }
+      } else {
+          Disable-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+          Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+      }
+
+      Remove-Item -Path "$targetDir\*" -Recurse -Force
+      Copy-Item -Path "$($current.backupPath)\*" -Destination $targetDir -Recurse -Force
+
+      $history[0].status = 'rolled-back'
+      $history | ConvertTo-Json -Depth 4 | Set-Content $manifest -Encoding UTF8
+
+      if (Test-Health $type $name $stabilitySeconds) {
+          Write-Host "Rollback verified: previous version is running. Failing run to flag the bad build."
+      } else {
+          Write-Error "Rollback restored files but host is STILL unhealthy. Manual intervention required."
+      }
+      exit 1
+    displayName: 'Start, Stability Gate, Auto-Rollback'
+    name: healthGate

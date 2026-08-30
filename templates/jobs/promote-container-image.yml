@@ -1,0 +1,45 @@
+
+parameters:
+# ACR Credentials
+  - name: sourceRegistryName
+    type: string
+  - name: targetRegistryName
+    type: string
+
+# Docker Image Details
+  - name: imageName
+    type: string
+  - name: imageVersion
+    type: string
+    default: latest
+  - name: environment
+    type: string
+  - name: poolName
+    type: string
+    default: ''
+  - name: azureServiceConnection
+    type: string
+
+jobs: 
+  - job: PromoteImage
+    displayName: 'Promote Image'
+    ${{ if eq(parameters.poolName, '') }}:
+      pool:
+        vmImage: 'ubuntu-latest'
+    ${{ else }}:
+      pool:
+        name: ${{ parameters.poolName }}
+
+    steps:
+    - checkout: self
+      displayName: 'Checkout Source Code'
+      clean: true
+
+    - template: ../steps/package/registry-promote.yml
+      parameters:
+        sourceRegistryName: ${{ parameters.sourceRegistryName }}
+        targetRegistryName: ${{ parameters.targetRegistryName }}
+        imageName: ${{ parameters.imageName }}
+        imageVersion: ${{ parameters.imageVersion }}
+        environment: ${{ parameters.environment }}
+        azureServiceConnection: ${{ parameters.azureServiceConnection }}

@@ -1,0 +1,211 @@
+# =====================================================================
+# rollback-steps-for-oci-cli-deployment.yml
+#
+# Standalone, manually-triggered rollback for the OpenShift deployment.
+# Because container images are immutable in ACR, rollback here means
+# repointing the Deployment at a known-good tag -- fast (seconds to a
+# couple of minutes), no file restores, no artifact re-download.
+#
+# Tag resolution order:
+#   1. rollbackToTag parameter, if provided (roll back to ANY tag
+#      still in ACR -- not limited to the immediately previous one)
+#   2. The rollback variable ($(TARGET_ROLLBACK_VAR_NAME)) from the
+#      '<appName>-image-tags' variable group, written by the deploy
+#      pipeline's captureState/record steps
+#   3. Fallback: `oc rollout undo` to the previous ReplicaSet revision
+#      (works even with no bookkeeping, as long as
+#      revisionHistoryLimit hasn't discarded it)
+#
+# After a successful rollback the variable group's current-tag
+# variable is updated to the restored tag, so subsequent deploys and
+# rollbacks reason from correct state.
+# =====================================================================
+
+parameters:
+  - name: appName
+    type: string
+  - name: targetEnvironment
+    type: string
+    default: dev
+  - name: dockerImageName
+    type: string
+  - name: acrUsername
+    type: string
+  - name: ocpServer
+    type: string
+  - name: ocpToken
+    type: string
+  - name: ocpNamespace
+    type: string
+  - name: rollbackToTag          # empty = use variable group / rollout undo
+    type: string
+    default: ''
+  - name: rolloutTimeout
+    type: string
+    default: "180s"
+  # Set FALSE when this template is called automatically (e.g. from a
+  # post-DAST/QA rollback stage). Blind `rollout undo` is only safe
+  # when a human confirms cluster state: if the deploy step already
+  # auto-rolled-back, a second undo would RE-DEPLOY THE BAD IMAGE.
+  - name: allowUndoFallback
+    type: boolean
+    default: true
+
+steps:
+  # Step 1: Resolve the rollback tag from the variable group
+  - task: AzureCLI@2
+    displayName: 'Rollback — Resolve Target Tag'
+    inputs:
+      azureSubscription: '$(azureServiceConnection)'
+      scriptType: 'bash'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
+        set -euo pipefail
+        WANTED_TAG="${{ parameters.rollbackToTag }}"
+
+        if [ -n "$WANTED_TAG" ]; then
+          echo "Explicit tag requested: $WANTED_TAG"
+          echo "##vso[task.setvariable variable=RESOLVED_TAG]$WANTED_TAG"
+          exit 0
+        fi
+
+        az extension add --name azure-devops --yes
+        DYNAMIC_GROUP_NAME="${{ parameters.appName }}-image-tags"
+        ROLLBACK_VARIABLE_NAME="$(TARGET_ROLLBACK_VAR_NAME)"
+
+        GROUP_ID=$(az pipelines variable-group list \
+          --project "$(System.TeamProject)" \
+          --query "[?name=='$DYNAMIC_GROUP_NAME'].id" \
+          --output tsv)
+
+        RESOLVED=""
+        if [ -n "$GROUP_ID" ]; then
+          RESOLVED=$(az pipelines variable-group variable list \
+            --group-id "$GROUP_ID" \
+            --project "$(System.TeamProject)" \
+            --query "\"$ROLLBACK_VARIABLE_NAME\".value" \
+            --output tsv 2>/dev/null || echo "")
+        fi
+
+        if [ -n "$RESOLVED" ] && [ "$RESOLVED" != "none" ]; then
+          echo "Resolved rollback tag from variable group: $RESOLVED"
+          echo "##vso[task.setvariable variable=RESOLVED_TAG]$RESOLVED"
+        else
+          echo "No rollback tag in variable group; will fall back to 'oc rollout undo'."
+          echo "##vso[task.setvariable variable=RESOLVED_TAG]UNDO"
+        fi
+    env:
+      AZURE_DEVOPS_EXT_PAT: $(ADMIN_PAT)
+
+  # Step 2: Authenticate, capture failed state, roll back, verify
+  - script: |
+      set -uo pipefail
+
+      oc login \
+        --token="$OCPTOKEN" \
+        --server=${{ parameters.ocpServer }} \
+        --insecure-skip-tls-verify
+      oc project ${{ parameters.ocpNamespace }}
+
+      IMAGE_NAME_LOWER=$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')
+      NS="${{ parameters.ocpNamespace }}"
+      TAG="$(RESOLVED_TAG)"
+
+      # ---- Record what is failing right now (for the audit trail) ----
+      FAILED_IMAGE=$(oc get deployment/"$IMAGE_NAME_LOWER" --namespace="$NS" \
+        -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "unknown")
+      echo "[ROLLBACK] Image being rolled AWAY from : $FAILED_IMAGE"
+      echo "##vso[task.setvariable variable=FAILED_TAG]${FAILED_IMAGE##*:}"
+
+      # ---- Execute rollback ----
+      if [ "$TAG" = "UNDO" ]; then
+        if [ "${{ parameters.allowUndoFallback }}" != "True" ] && [ "${{ parameters.allowUndoFallback }}" != "true" ]; then
+          echo "##vso[task.logissue type=error][ROLLBACK] No explicit rollback tag resolved and undo fallback is disabled (automated context)."
+          echo "[ROLLBACK] Refusing blind 'rollout undo': if the deploy step already auto-rolled-back, undo-of-undo would RE-DEPLOY THE BAD IMAGE."
+          echo "[ROLLBACK] Run the standalone rollback pipeline with an explicit rollbackToTag instead."
+          exit 1
+        fi
+        echo "[ROLLBACK] Using ReplicaSet history: oc rollout undo"
+        oc rollout undo deployment/"$IMAGE_NAME_LOWER" --namespace="$NS" || {
+          echo "##vso[task.logissue type=error][ROLLBACK] rollout undo failed -- no previous revision available."
+          exit 1
+        }
+      else
+        TARGET_IMAGE=$(echo "$ACR_NAME/$IMAGE_NAME:$TAG" | tr '[:upper:]' '[:lower:]')
+        echo "[ROLLBACK] Repointing deployment to: $TARGET_IMAGE"
+        # '*=' updates every container in the pod spec
+        oc set image deployment/"$IMAGE_NAME_LOWER" "*=$TARGET_IMAGE" --namespace="$NS" || {
+          echo "##vso[task.logissue type=error][ROLLBACK] oc set image failed."
+          exit 1
+        }
+      fi
+
+      oc annotate deployment/"$IMAGE_NAME_LOWER" \
+        kubernetes.io/change-cause="ROLLBACK by build=$(Build.BuildId) to tag=$TAG (was ${FAILED_IMAGE##*:})" \
+        --namespace="$NS" --overwrite
+
+      # ---- Verify the rollback rollout ----
+      if ! oc rollout status deployment/"$IMAGE_NAME_LOWER" \
+             --namespace="$NS" --timeout=${{ parameters.rolloutTimeout }}; then
+        echo "##vso[task.logissue type=error][ROLLBACK] Rollback rollout did NOT become ready. Diagnostics:"
+        oc get pods --namespace="$NS" -l app="$IMAGE_NAME_LOWER" -o wide || true
+        oc get events --namespace="$NS" --sort-by=.lastTimestamp | tail -n 20 || true
+        exit 1
+      fi
+
+      RESTORED_IMAGE=$(oc get deployment/"$IMAGE_NAME_LOWER" --namespace="$NS" \
+        -o jsonpath='{.spec.template.spec.containers[0].image}')
+      echo "[ROLLBACK] SUCCESS. Now serving: $RESTORED_IMAGE"
+      echo "##vso[task.setvariable variable=RESTORED_TAG]${RESTORED_IMAGE##*:}"
+    displayName: 'Rollback — Repoint Deployment and Verify'
+    env:
+      OCPTOKEN: ${{ parameters.ocpToken }}
+      IMAGE_NAME: ${{ parameters.dockerImageName }}
+      ACR_NAME: ${{ parameters.acrUsername }}.azurecr.io
+
+  # Step 3: Sync variable group so future runs see correct state
+  - task: AzureCLI@2
+    displayName: 'Rollback — Update Variable Group Bookkeeping'
+    condition: succeeded()
+    inputs:
+      azureSubscription: '$(azureServiceConnection)'
+      scriptType: 'bash'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
+        set -euo pipefail
+        az extension add --name azure-devops --yes
+
+        DYNAMIC_GROUP_NAME="${{ parameters.appName }}-image-tags"
+        VARIABLE_NAME="$(TARGET_VAR_NAME)"
+        RESTORED="$(RESTORED_TAG)"
+        FAILED="$(FAILED_TAG)"
+
+        GROUP_ID=$(az pipelines variable-group list \
+          --project "$(System.TeamProject)" \
+          --query "[?name=='$DYNAMIC_GROUP_NAME'].id" \
+          --output tsv)
+
+        if [ -z "$GROUP_ID" ]; then
+          echo "Variable group '$DYNAMIC_GROUP_NAME' not found; skipping bookkeeping."
+          exit 0
+        fi
+
+        # Current tag <- what we just restored
+        az pipelines variable-group variable update \
+          --group-id "$GROUP_ID" --name "$VARIABLE_NAME" --value "$RESTORED" \
+          --project "$(System.TeamProject)" --output none 2>/dev/null || \
+        az pipelines variable-group variable create \
+          --group-id "$GROUP_ID" --name "$VARIABLE_NAME" --value "$RESTORED" \
+          --project "$(System.TeamProject)" --output none
+
+        # Keep a record of what failed, for post-mortem
+        az pipelines variable-group variable update \
+          --group-id "$GROUP_ID" --name "LAST_FAILED_TAG" --value "$FAILED" \
+          --project "$(System.TeamProject)" --output none 2>/dev/null || \
+        az pipelines variable-group variable create \
+          --group-id "$GROUP_ID" --name "LAST_FAILED_TAG" --value "$FAILED" \
+          --project "$(System.TeamProject)" --output none
+
+        echo "Bookkeeping updated: current=$RESTORED, last_failed=$FAILED"
+    env:
+      AZURE_DEVOPS_EXT_PAT: $(ADMIN_PAT)

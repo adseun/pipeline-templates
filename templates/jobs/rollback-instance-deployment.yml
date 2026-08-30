@@ -1,0 +1,96 @@
+# jobs/rollback-instance-deployment.yml
+#
+# Merged replacement for the three near-identical VM rollback job wrappers:
+#   rollback-iis-deployment.yml                    (platform: windows)
+#   rollback-cronjob-windowsservice-deployment.yml (platform: windows-worker)
+#
+# Those three shared an identical parameter list, timeout, Environment block
+# and runOnce strategy; they differed only in path defaults, job name, agent
+# image and which steps template they called.
+#
+# The underlying templates/steps/rollback/* files stay separate -- they hold
+# genuinely different bash / PowerShell logic and should not be forced together.
+#
+# Platform-specific defaults (deployPath, backupRoot) are NOT set here, since a
+# single default cannot serve both Windows and Linux paths. Callers already pass
+# these explicitly; the merged template requires them rather than silently
+# applying a default for the wrong OS.
+
+parameters:
+  - name: platform
+    type: string
+    values:
+      - windows         # IIS site
+      - windows-worker  # Windows Service / Task Scheduler job
+
+  - name: projectName
+    type: string
+  - name: deployPath
+    type: string
+  - name: backupRoot
+    type: string
+  - name: rollbackToBuildId      # empty = latest backup in manifest
+    type: string
+    default: ''
+  - name: environmentConfig
+    type: object
+    default: {}
+  - name: poolName
+    type: string
+
+  # ---- windows (IIS web) only ----
+  - name: port
+    type: number
+    default: 0
+  - name: healthCheckPath
+    type: string
+    default: '/'
+
+  # ---- windows-worker only ----
+  - name: deploymentType
+    type: string
+    default: 'WindowsService'
+    values: ['WindowsService', 'CronJob']
+  - name: binaryPath
+    type: string
+    default: ''
+
+jobs:
+  - deployment: Rollback_Instance_Deployment
+    ${{ if eq(parameters.platform, 'windows') }}:
+      displayName: 'Rollback frontend or backend deployment Windows Instance'
+    ${{ if eq(parameters.platform, 'windows-worker') }}:
+      displayName: 'Job to rollback deployed cronjob or windowsservice'
+    timeoutInMinutes: 20
+    ${{ if ne(parameters.poolName, '') }}:
+      pool:
+        name: ${{ parameters.poolName }}
+    ${{ else }}:
+      pool:
+        vmImage: 'windows-latest'
+    environment:
+      name: '${{ parameters.environmentConfig.environmentName }}'
+      resourceType: virtualMachine
+      tags: 'web'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - ${{ if eq(parameters.platform, 'windows') }}:
+              - template: ../steps/rollback/iis.yml
+                parameters:
+                  projectName: ${{ parameters.projectName }}
+                  deployPath: ${{ parameters.deployPath }}
+                  port: ${{ parameters.port }}
+                  backupRoot: ${{ parameters.backupRoot }}
+                  rollbackToBuildId: ${{ parameters.rollbackToBuildId }}   # empty = latest backup in manifest
+                  healthCheckPath: ${{ parameters.healthCheckPath }}
+            - ${{ if eq(parameters.platform, 'windows-worker') }}:
+              - template: ../steps/rollback/windows-worker.yml
+                parameters:
+                  projectName: ${{ parameters.projectName }}
+                  deployPath: ${{ parameters.deployPath }}
+                  backupRoot: ${{ parameters.backupRoot }}
+                  rollbackToBuildId: ${{ parameters.rollbackToBuildId }}   # empty = latest backup in manifest
+                  deploymentType: ${{ parameters.deploymentType }}
+                  binaryPath: ${{ parameters.binaryPath }}

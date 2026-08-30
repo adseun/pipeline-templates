@@ -1,0 +1,46 @@
+
+parameters:
+  - name: BuildType
+    type: string
+
+  - name: poolName
+    type: string
+    default: ''
+  - name: IsLegacyCode
+    type: boolean
+    default: false
+  
+  - name: pathToProjectBuildFile
+    type: string
+    default: ''
+
+  - name: programmingLanguage
+    type: string
+  
+  - name: projectName
+    type: string
+    
+  
+
+  - name: javaVersion
+    type: string
+
+jobs: 
+  - job: BuildContainerisedBackend
+    displayName: 'Run SAST+SCA Scans, Test, Build and Publish Artifacts'
+    ${{ if eq(parameters.poolName, '') }}:
+      pool:
+        vmImage: 'ubuntu-latest'
+    ${{ else }}:
+      pool:
+        name: ${{ parameters.poolName }}
+
+    steps:
+      - template: ../steps/composite/backend.yml
+        parameters:
+          IsLegacyCode: ${{ parameters.IsLegacyCode }}
+          programmingLanguage: ${{ parameters.programmingLanguage }}
+          BuildType: ${{ parameters.BuildType }}
+          pathToProjectBuildFile: ${{ parameters.pathToProjectBuildFile }}
+          projectName: ${{ parameters.projectName }}
+          javaVersion: ${{ parameters.javaVersion }}

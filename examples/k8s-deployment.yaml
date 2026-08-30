@@ -1,0 +1,119 @@
+# =====================================================================
+# deployment.yaml 
+#
+# why each one matters for rollback:
+#
+#   1. readinessProbe   -> without it, `oc rollout status` reports
+#      success the instant the container process starts, even if the
+#      app is crashing or serving 500s. Your pipeline's health gate
+#      and auto-rollback are only as good as this probe.
+#   2. livenessProbe    -> restarts a wedged container after deploy.
+#   3. strategy: maxUnavailable 0 / maxSurge 1 -> old pods stay
+#      serving until a NEW pod passes readiness. A bad image never
+#      takes traffic; deploy AND rollback are both zero-downtime.
+#   4. revisionHistoryLimit: 10 -> guarantees `oc rollout undo` (the
+#      pipeline's fallback tier) has ReplicaSets to return to.
+#   5. progressDeadlineSeconds: 150 -> k8s marks the rollout as
+#      failed BEFORE the pipeline's 180s `rollout status` timeout,
+#      so auto-rollback triggers cleanly instead of racing.
+#   6. minReadySeconds: 10 -> a pod must stay ready 10s before it
+#      counts, catching apps that start then immediately crash.
+#   7. imagePullPolicy: IfNotPresent -> with immutable tags this is
+#      safe, and it means rollback can reuse the image cached on the
+#      node even if ACR is unreachable at rollback time. 'Always'
+#      makes rollback depend on the registry being up.
+#   8. resources requests/limits -> without requests, an OOM or CPU
+#      starvation on the node can make a *good* image fail its
+#      rollout and trigger a false rollback.
+#
+# =====================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: APP_NAME
+  namespace: APP_NAMESPACE
+  labels:
+    app: APP_NAME
+spec:
+  replicas: 2
+  revisionHistoryLimit: 10
+  progressDeadlineSeconds: 150
+  minReadySeconds: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: APP_NAME
+  template:
+    metadata:
+      labels:
+        app: APP_NAME
+    spec:
+      imagePullSecrets:
+        - name: PULL_SECRET
+      containers:
+        - name: APP_NAME
+          image: IMAGE_TAG
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /          # <-- change to your app's real health endpoint
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /         # <-- same here
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: APP_NAME
+  namespace: APP_NAMESPACE
+  labels:
+    app: APP_NAME
+spec:
+  selector:
+    app: APP_NAME
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8080
+      targetPort: http
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: APP_NAME
+  namespace: APP_NAMESPACE
+  labels:
+    app: APP_NAME
+spec:
+  to:
+    kind: Service
+    name: APP_NAME
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

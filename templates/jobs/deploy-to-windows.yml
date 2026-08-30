@@ -1,0 +1,90 @@
+parameters:
+  - name: projectName
+    type: string
+  - name: deployPath
+    type: string
+  - name: environmentConfig
+    type: object
+    default: {}
+  - name: port
+    type: number
+    default: '8888'
+  - name: customSubFolderForArtifact
+    type: string
+  - name: customDestinationFolder
+    type: string
+  - name: deploymentType
+    type: string
+    default: 'IISService-Frontend'
+    values:
+      - 'IISService-Frontend'
+      - 'IISService-Backend'
+      - 'WindowsService'
+      - 'CronJob'  
+  - name: binaryPath
+    type: string
+    default: 'D:\Applications\DevSecOpsUI\DevSecOpsUI.exe' # Exact path to executable
+  - name: cronSchedule
+    type: string
+    default: '09:00' # Trigger time if deploymentType is CronJob (24-hour format)
+  - name: runAsUser
+    type: string
+    default: 'NT AUTHORITY\SYSTEM' # Execution context
+
+jobs:
+  - deployment: VMDeployment
+    displayName: 'Deploy to Azure VM'
+    timeoutInMinutes: 20
+    pool:
+      vmImage: 'ubuntu-latest'
+    environment: 
+      name: '${{ parameters.environmentConfig.environmentName }}'
+      resourceType: virtualMachine
+      tags: 'web'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - ${{ if eq(parameters.deploymentType, 'IISService-Frontend') }}:
+              - template: ../steps/deploy/iis.yml
+                parameters:
+                  projectName: ${{ parameters.projectName }}
+                  deployPath: ${{ parameters.deployPath }}
+                  customSubFolderForArtifact: ${{ parameters.customSubFolderForArtifact }}
+                  customDestinationFolder: ${{ parameters.customDestinationFolder }}
+                  port: ${{ parameters.port }}
+                  appType: 'frontend'
+
+            - ${{ if eq(parameters.deploymentType, 'IISService-Backend') }}:
+              - template: ../steps/deploy/iis.yml
+                parameters:
+                  projectName: ${{ parameters.projectName }}
+                  deployPath: ${{ parameters.deployPath }}
+                  customSubFolderForArtifact: ${{ parameters.customSubFolderForArtifact }}
+                  customDestinationFolder: ${{ parameters.customDestinationFolder }}
+                  port: ${{ parameters.port }}
+                  appType: 'backend'
+
+            - ${{ if eq(parameters.deploymentType, 'WindowsService') }}:
+              - template: ../steps/deploy/windows-worker.yml
+                parameters:
+                  projectName: ${{ parameters.projectName }}
+                  deployPath: ${{ parameters.deployPath }}
+                  customSubFolderForArtifact: ${{ parameters.customSubFolderForArtifact }}
+                  customDestinationFolder: ${{ parameters.customDestinationFolder }}
+                  binaryPath: ${{ parameters.binaryPath }}
+                  cronSchedule: ${{ parameters.cronSchedule }}
+                  runAsUser: ${{ parameters.runAsUser }}
+
+            - ${{ if eq(parameters.deploymentType, 'CronJob') }}:
+              - template: ../steps/deploy/windows-worker.yml
+                parameters:
+                  projectName: ${{ parameters.projectName }}
+                  deployPath: ${{ parameters.deployPath }}
+                  customSubFolderForArtifact: ${{ parameters.customSubFolderForArtifact }}
+                  customDestinationFolder: ${{ parameters.customDestinationFolder }}
+                  binaryPath: ${{ parameters.binaryPath }}
+                  cronSchedule: ${{ parameters.cronSchedule }}
+                  runAsUser: ${{ parameters.runAsUser }}
+
+                

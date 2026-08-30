@@ -1,0 +1,126 @@
+parameters:
+  # Language/stack, passed to the Snyk scan and the build steps
+  - name: BuildType
+    type: string
+
+  - name: buildConfiguration
+    type: string
+    default: 'Release'
+
+
+  - name: programmingLanguage
+    type: string
+  - name: pathToProjectBuildFile
+    type: string
+  
+  - name: javaVersion
+    type: string
+
+steps:
+  - checkout: self
+    clean: true
+
+  # SAST steps
+  - template: ../security/sast-snyk.yml
+    parameters:
+      BuildType: ${{ parameters.BuildType }}
+  
+  - ${{ if eq(parameters.programmingLanguage, 'dotnet') }}:
+    - task: NuGetToolInstaller@1
+
+    - task: NuGetCommand@2
+      inputs:
+        restoreSolution: '**/*.sln'
+        command: 'restore'
+
+    - task: VSBuild@1
+      inputs:
+        solution: '**/*.sln'
+        # CRITICAL: Added /p:DeployOnBuild=true to generate correct outputs for the publish step later
+        msbuildArgs: '/p:Configuration=${{ parameters.buildConfiguration }} /p:NoWarn="NU1605;NU1701" /p:DeployOnBuild=true /p:WebPublishMethod=Package /p:PackageAsSingleFile=true /p:SkipInvalidConfigurations=true /p:DesktopBuildPackageLocation="$(Build.ArtifactStagingDirectory)"'
+        platform: 'Any CPU'
+        configuration: ${{ parameters.buildConfiguration }}
+
+    - task: VSTest@2
+      displayName: 'Run Legacy Tests & Collect Coverage'
+      inputs:
+        testSelector: 'testAssemblies'
+        testAssemblyVer2: |
+            **\*test*.dll
+            !**\*TestAdapter.dll
+            !**\obj\**
+        searchFolder: '$(System.DefaultWorkingDirectory)'
+        configuration: ${{ parameters.buildConfiguration }}
+        publishRunAttachments: true 
+        # ENABLE NATIVE COVERAGE: This generates a .coverage binary file automatically
+        codeCoverageEnabled: true
+
+    - task: DotNetCoreCLI@2
+      inputs:
+        command: 'publish'
+        publishWebProjects: true
+        arguments: '--configuration ${{ parameters.buildConfiguration }} --output $(Build.ArtifactStagingDirectory)'
+        zipAfterPublish: true
+      continueOnError: true 
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'drop'
+
+    # -------------------------------------------------------------
+    #  MANAGE 10% COVERAGE THRESHOLD FOR LEGACY PROJECTS (if tests exist)
+    # -------------------------------------------------------------
+
+    # Install ReportGenerator to convert binary .coverage to human/machine readable files
+    - script: |
+        echo "Installing ReportGenerator Global Tool..."
+        dotnet tool install --global dotnet-reportgenerator-globaltool
+      displayName: 'Install ReportGenerator'
+      condition: succeeded()
+
+    - powershell: |
+        # Define search directory (where VSTest dumps legacy .coverage files)
+        $searchDir = "$(Agent.TempDirectory)"
+        Write-Host "Searching for coverage files in $searchDir..."
+        
+        # Recursively look for any .coverage or .xml files
+        $coverageFiles = Get-ChildItem -Path $searchDir -Filter "*.coverage" -Recurse
+        if (-not $coverageFiles) {
+            $coverageFiles = Get-ChildItem -Path $searchDir -Filter "*.cobertura.xml" -Recurse
+        }
+        
+        # If no files are found, exit gracefully without failing the build
+        if (-not $coverageFiles) {
+            Write-Host "No test coverage files found. Skipping threshold validation."
+            exit 0
+        }
+        
+        Write-Host "Found coverage files. Evaluating 10% metric threshold..."
+        
+        # Execute ReportGenerator using Windows-safe syntax
+        reportgenerator `
+        -reports:"$searchDir\**\*.coverage" `
+        -targetdir:"$(Build.SourcesDirectory)\TestResults\CoverageReport" `
+        -reporttypes:"HtmlInline_AzurePipelines;Cobertura" `
+        -failonoptions:LineCoverageLessThan10
+        
+        # Forward the exit code from ReportGenerator to Azure DevOps
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "Code coverage is below the mandatory 10% threshold!"
+            exit $LASTEXITCODE
+        }
+      displayName: 'Validate 10% Coverage Threshold'
+      condition: succeeded()
+
+    # Publish the converted results back up to the Azure DevOps Pipeline UI
+    - task: PublishCodeCoverageResults@2
+      displayName: 'Publish Code Coverage Report'
+      condition: succeeded()
+      inputs:
+        summaryFileLocation: '$(Build.SourcesDirectory)/TestResults/CoverageReport/Cobertura.xml'
+        failIfCoverageEmpty: false
+
+  # - script: ls -R $(Agent.BuildDirectory)
+
+      

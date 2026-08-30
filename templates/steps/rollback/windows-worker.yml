@@ -1,0 +1,194 @@
+# =====================================================================
+# rollback-steps-for-cronjob-windowsservice.yml
+#
+# Standalone, manually-triggered rollback for Windows Services and
+# Scheduled Tasks. Restores a previous version from the backups made
+# by deploy-template-winservice.yml.
+#
+# Tag resolution:
+#   rollbackToBuildId = ''       -> newest backup recorded in the
+#                                   manifest (last known-good)
+#   rollbackToBuildId = '12345'  -> <backupRoot>\<projectName>_12345
+#
+# The failing version currently in deployPath is preserved at
+# <backupRoot>\<projectName>_FAILED_<timestamp> for diagnosis.
+# Restore is a COPY, so the backup remains reusable.
+# Includes the same idempotency-style guard pattern: if the resolved
+# backup folder's contents already match what's deployed (same
+# buildinfo.json buildId when present), it exits as a no-op.
+# =====================================================================
+
+parameters:
+  - name: deployPath
+    type: string
+    default: 'D:\Applications\DevSecOpsWorker'
+  - name: projectName
+    type: string
+    default: 'DevSecOpsWorker'
+  - name: deploymentType
+    type: string
+    default: 'WindowsService'
+    values: ['WindowsService', 'CronJob']
+  - name: binaryPath
+    type: string
+  - name: backupRoot
+    type: string
+    default: 'D:\Applications\Backups'
+  - name: rollbackToBuildId
+    type: string
+    default: ''
+  - name: stabilitySeconds
+    type: number
+    default: 30
+  - name: runTaskOnRollback      # CronJob: trigger once to verify
+    type: boolean
+    default: false
+
+steps:
+  - powershell: |
+      $ErrorActionPreference = 'Stop'
+      $type        = "${{ parameters.deploymentType }}"
+      $name        = "${{ parameters.projectName }}"
+      $targetDir   = "${{ parameters.deployPath }}"
+      $backupRoot  = "${{ parameters.backupRoot }}"
+      $wantedBuild = "${{ parameters.rollbackToBuildId }}"
+      $binPath     = "${{ parameters.binaryPath }}"
+      $manifest    = Join-Path $backupRoot "$name-deployment-history.json"
+      $stabilitySeconds = ${{ parameters.stabilitySeconds }}
+
+      # ---------- Resolve which backup to restore ----------
+      $backupDir = $null
+      if (-not [string]::IsNullOrWhiteSpace($wantedBuild)) {
+          $backupDir = Join-Path $backupRoot "$($name)_$wantedBuild"
+      } elseif (Test-Path $manifest) {
+          $history = @(Get-Content $manifest -Raw | ConvertFrom-Json)
+          $entry = $history | Where-Object { $_.backupPath } | Select-Object -First 1
+          if ($entry) { $backupDir = $entry.backupPath }
+      }
+      if (-not $backupDir) {
+          $latest = Get-ChildItem -Path $backupRoot -Directory -Filter "$($name)_*" |
+                    Where-Object { $_.Name -notmatch 'FAILED' } |
+                    Sort-Object CreationTime -Descending | Select-Object -First 1
+          if ($latest) { $backupDir = $latest.FullName }
+      }
+      if (-not $backupDir -or !(Test-Path $backupDir) -or ((Get-ChildItem $backupDir -Recurse -File).Count -eq 0)) {
+          Write-Error "No usable backup found ('$backupDir'). Cannot roll back."
+          exit 1
+      }
+      Write-Host "Rolling back '$name' using backup: $backupDir"
+
+      # ---------- Idempotency guard (via buildinfo.json if present) ----------
+      $deployedInfo = Join-Path $targetDir 'buildinfo.json'
+      $backupInfo   = Join-Path $backupDir 'buildinfo.json'
+      if ((Test-Path $deployedInfo) -and (Test-Path $backupInfo)) {
+          $d = (Get-Content $deployedInfo -Raw | ConvertFrom-Json).buildId
+          $b = (Get-Content $backupInfo  -Raw | ConvertFrom-Json).buildId
+          if ($d -and $b -and ($d -eq $b)) {
+              Write-Host "Deployed buildId ($d) already matches rollback target. Nothing to do; a prior rollback restored this version."
+              exit 0
+          }
+      }
+
+      # ---------- Stop the host ----------
+      if ($type -eq "WindowsService") {
+          if (Get-Service -Name $name -ErrorAction SilentlyContinue) {
+              Stop-Service -Name $name -Force -WarningAction SilentlyContinue
+              $retry = 0
+              while ((Get-Service -Name $name).Status -ne 'Stopped' -and $retry -lt 10) {
+                  Start-Sleep -Seconds 2; $retry++
+              }
+              if ((Get-Service -Name $name).Status -ne 'Stopped') {
+                  $servicePid = (Get-CimInstance Win32_Service -Filter "Name='$name'").ProcessId
+                  if ($servicePid) { Stop-Process -Id $servicePid -Force -ErrorAction SilentlyContinue }
+              }
+          }
+      } else {
+          Disable-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+          Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+      }
+
+      # ---------- Preserve failed version, restore backup ----------
+      $failedDir = Join-Path $backupRoot "$($name)_FAILED_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+      if ((Test-Path $targetDir) -and ((Get-ChildItem $targetDir).Count -gt 0)) {
+          New-Item -ItemType Directory -Path $failedDir -Force | Out-Null
+          Move-Item -Path "$targetDir\*" -Destination $failedDir -Force
+          Write-Host "Failed version preserved at: $failedDir"
+      } else {
+          New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+          $failedDir = $null
+      }
+      Copy-Item -Path "$backupDir\*" -Destination $targetDir -Recurse -Force
+      Write-Host "Backup restored to $targetDir"
+
+      # ---------- Re-sync host registration to restored binary ----------
+      if ($type -eq "WindowsService") {
+          if (Get-Service -Name $name -ErrorAction SilentlyContinue) {
+              sc.exe config $name binPath= "$binPath" | Out-Null
+              Start-Service -Name $name
+          } else {
+              Write-Error "Service '$name' is not registered; run the deploy pipeline to register it."
+              exit 1
+          }
+      } else {
+          $action = New-ScheduledTaskAction -Execute $binPath `
+                        -WorkingDirectory (Split-Path $binPath -Parent)
+          Set-ScheduledTask -TaskName $name -Action $action | Out-Null
+          Enable-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+      }
+
+      # ---------- Update manifest ----------
+      if (Test-Path $manifest) {
+          $history = @(Get-Content $manifest -Raw | ConvertFrom-Json)
+          $entry = [pscustomobject]@{
+              buildId        = 'manual-rollback'
+              buildNumber    = "$(Build.BuildNumber)"
+              deployedAt     = (Get-Date).ToString('o')
+              backupPath     = $failedDir
+              deployPath     = $targetDir
+              binaryPath     = $binPath
+              deploymentType = $type
+              status         = "rolled-back-to:$([IO.Path]::GetFileName($backupDir))"
+          }
+          $history = @($entry) + $history
+          $history | ConvertTo-Json -Depth 4 | Set-Content $manifest -Encoding UTF8
+      }
+
+      # ---------- Verify (same stability logic as deploy) ----------
+      if ($type -eq "WindowsService") {
+          Start-Sleep -Seconds 5
+          $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+          if (-not $svc -or $svc.Status -ne 'Running') {
+              Write-Error "Rollback restored files but service is not Running."
+              exit 1
+          }
+          $pid0 = (Get-CimInstance Win32_Service -Filter "Name='$name'").ProcessId
+          $elapsed = 0
+          while ($elapsed -lt $stabilitySeconds) {
+              Start-Sleep -Seconds 5; $elapsed += 5
+              $svc  = Get-Service -Name $name
+              $pidN = (Get-CimInstance Win32_Service -Filter "Name='$name'").ProcessId
+              if ($svc.Status -ne 'Running' -or $pidN -ne $pid0) {
+                  Write-Error "Rolled-back service is unstable (status=$($svc.Status), pid $pid0 -> $pidN)."
+                  exit 1
+              }
+          }
+          Write-Host "Rollback verified: service Running and stable for ${stabilitySeconds}s."
+      } else {
+          if ("${{ parameters.runTaskOnRollback }}" -in @("True","true")) {
+              Start-ScheduledTask -TaskName $name
+              $elapsed = 0
+              do {
+                  Start-Sleep -Seconds 5; $elapsed += 5
+                  $state = (Get-ScheduledTask -TaskName $name).State
+              } while ($state -eq 'Running' -and $elapsed -lt 300)
+              $result = (Get-ScheduledTaskInfo -TaskName $name).LastTaskResult
+              if ($result -ne 0) {
+                  Write-Error "Rolled-back task ran but exited with LastTaskResult=$result."
+                  exit 1
+              }
+              Write-Host "Rollback verified: task executed with result 0."
+          } else {
+              Write-Host "Rollback complete: task re-enabled and pointed at restored binary."
+          }
+      }
+    displayName: 'Rollback Service/Task Deployment'

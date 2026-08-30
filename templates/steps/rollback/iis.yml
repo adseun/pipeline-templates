@@ -1,0 +1,144 @@
+# =====================================================================
+# rollback-steps-for-iis-deployment.yml
+#
+# Standalone, manually-triggered rollback. Restores a previous version
+# from the backup folders created by deploy-template.yml.
+#
+# Usage:
+#   - rollbackToBuildId = ''        -> rolls back to the most recent
+#                                      backup recorded in the manifest
+#   - rollbackToBuildId = '12345'   -> restores backup folder
+#                                      <backupRoot>\<projectName>_12345
+#
+# Run this from a separate pipeline (or a manual stage) that targets
+# the same deployment agent/environment as the deploy pipeline.
+# =====================================================================
+
+parameters:
+  - name: deployPath
+    type: string
+    default: 'D:\Applications\DevSecOpsUI'
+  - name: projectName
+    type: string
+    default: 'DevSecOpsUI'
+  - name: port
+    type: number
+    default: 8087
+  - name: backupRoot
+    type: string
+    default: 'D:\Applications\Backups'
+  - name: rollbackToBuildId      # empty = latest backup in manifest
+    type: string
+    default: ''
+  - name: healthCheckPath
+    type: string
+    default: '/'
+
+steps:
+  - powershell: |
+      $ErrorActionPreference = 'Stop'
+      Import-Module WebAdministration
+
+      $projectName = "${{ parameters.projectName }}"
+      $targetDir   = "${{ parameters.deployPath }}"
+      $backupRoot  = "${{ parameters.backupRoot }}"
+      $port        = "${{ parameters.port }}"
+      $hcPath      = "${{ parameters.healthCheckPath }}"
+      $wantedBuild = "${{ parameters.rollbackToBuildId }}"
+      $manifest    = Join-Path $backupRoot "$projectName-deployment-history.json"
+
+      # ---------- Resolve which backup to restore ----------
+      $backupDir = $null
+      if (-not [string]::IsNullOrWhiteSpace($wantedBuild)) {
+          $backupDir = Join-Path $backupRoot "$($projectName)_$wantedBuild"
+      } elseif (Test-Path $manifest) {
+          $history = @(Get-Content $manifest -Raw | ConvertFrom-Json)
+          $entry = $history | Where-Object { $_.backupPath } | Select-Object -First 1
+          if ($entry) { $backupDir = $entry.backupPath }
+      }
+
+      if (-not $backupDir) {
+          # Last resort: newest backup folder on disk
+          $latest = Get-ChildItem -Path $backupRoot -Directory -Filter "$($projectName)_*" |
+                    Sort-Object CreationTime -Descending | Select-Object -First 1
+          if ($latest) { $backupDir = $latest.FullName }
+      }
+
+      if (-not $backupDir -or !(Test-Path $backupDir)) {
+          Write-Error "No usable backup found (looked for '$backupDir'). Cannot roll back."
+          exit 1
+      }
+      if ((Get-ChildItem $backupDir -Recurse -File).Count -eq 0) {
+          Write-Error "Backup folder '$backupDir' is empty. Cannot roll back."
+          exit 1
+      }
+      Write-Host "Rolling back '$projectName' using backup: $backupDir"
+
+      # ---------- Preserve the failed version for diagnosis ----------
+      $failedDir = Join-Path $backupRoot "$($projectName)_FAILED_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+
+      # ---------- Stop app pool ----------
+      if (Test-Path "IIS:\AppPools\$projectName") {
+          if ((Get-WebAppPoolState -Name $projectName).Value -ne 'Stopped') {
+              Stop-WebAppPool -Name $projectName
+              $tries = 0
+              while ((Get-WebAppPoolState -Name $projectName).Value -ne 'Stopped' -and $tries -lt 30) {
+                  Start-Sleep -Seconds 1; $tries++
+              }
+          }
+      }
+
+      # ---------- Swap: move bad version aside, restore backup ----------
+      if ((Test-Path $targetDir) -and (Get-ChildItem $targetDir).Count -gt 0) {
+          New-Item -ItemType Directory -Path $failedDir -Force | Out-Null
+          Move-Item -Path "$targetDir\*" -Destination $failedDir -Force
+          Write-Host "Current (bad) version preserved at: $failedDir"
+      } else {
+          New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+      }
+
+      # Copy (not Move) so the backup remains reusable
+      Copy-Item -Path "$backupDir\*" -Destination $targetDir -Recurse -Force
+      Write-Host "Backup restored to $targetDir"
+
+      # ---------- Start app pool + site ----------
+      if (!(Test-Path "IIS:\AppPools\$projectName")) { New-WebAppPool -Name $projectName }
+      Start-WebAppPool -Name $projectName
+      Start-Website -Name $projectName -ErrorAction SilentlyContinue
+
+      # ---------- Update manifest ----------
+      if (Test-Path $manifest) {
+          $history = @(Get-Content $manifest -Raw | ConvertFrom-Json)
+          $entry = [pscustomobject]@{
+              buildId    = 'manual-rollback'
+              buildNumber= "$(Build.BuildNumber)"
+              deployedAt = (Get-Date).ToString('o')
+              backupPath = $failedDir
+              deployPath = $targetDir
+              status     = "rolled-back-to:$([IO.Path]::GetFileName($backupDir))"
+          }
+          $history = @($entry) + $history
+          $history | ConvertTo-Json -Depth 4 | Set-Content $manifest -Encoding UTF8
+      }
+
+      # ---------- Verify ----------
+      $url = "http://localhost:$port$hcPath"
+      $healthy = $false
+      for ($i = 1; $i -le 6; $i++) {
+          Start-Sleep -Seconds 10
+          try {
+              $resp = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 15
+              if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 400) {
+                  Write-Host "Rollback verified: HTTP $($resp.StatusCode) at $url"
+                  $healthy = $true
+                  break
+              }
+          } catch {
+              Write-Host "Verify attempt $i/6 failed: $($_.Exception.Message)"
+          }
+      }
+      if (-not $healthy) {
+          Write-Error "Rollback restored files but the site is still not responding at $url."
+          exit 1
+      }
+    displayName: 'Rollback IIS Deployment'

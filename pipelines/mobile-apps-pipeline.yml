@@ -1,0 +1,294 @@
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+      - release/*
+  paths:
+    exclude:
+      - "*.md"
+      - "docs/**"
+
+pr: none
+
+variables:
+  - group: devsecops-secrets
+  - name: NODE_VERSION
+    value: "18.x"
+  - name: JAVA_VERSION
+    value: "17"
+  - name: RUN_SECURITY_SCAN
+    value: "true"
+  - name: RUN_DISTRIBUTE
+    value: "false"
+
+stages:
+
+# ─────────────────────────────────────────────────────────────
+# STAGE 1 — BUILD
+# ─────────────────────────────────────────────────────────────
+
+  - stage: Build
+    displayName: "Build APK and IPA"
+    jobs:
+
+      # ── Android Build ──────────────────────────────────────
+      - job: BuildAndroid
+        displayName: "Build Android APK"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+
+          - task: NodeTool@0
+            displayName: "Set up Node.js"
+            inputs:
+              versionSpec: $(NODE_VERSION)
+
+          - task: JavaToolInstaller@0
+            displayName: "Set up JDK"
+            inputs:
+              versionSpec: $(JAVA_VERSION)
+              jdkArchitectureOption: "x64"
+              jdkSourceOption: "PreInstalled"
+
+          - script: npm install
+            displayName: "Install dependencies"
+
+          - task: DownloadSecureFile@1
+            name: androidKeystore
+            displayName: "Download release keystore"
+            inputs:
+              secureFile: "release.keystore"
+
+          - script: |
+              echo "sdk.dir=$ANDROID_HOME" > android/local.properties
+            displayName: "Configure Android SDK path"
+
+          - script: |
+              cat >> android/gradle.properties <<EOF
+              RELEASE_STORE_FILE=$(androidKeystore.secureFilePath)
+              RELEASE_KEY_ALIAS=$(ANDROID_KEY_ALIAS)
+              RELEASE_STORE_PASSWORD=$(ANDROID_STORE_PASSWORD)
+              RELEASE_KEY_PASSWORD=$(ANDROID_KEY_PASSWORD)
+              EOF
+            displayName: "Inject signing credentials"
+
+          - script: |
+              mkdir -p android/gradle/wrapper
+              curl -L https://github.com/gradle/gradle/raw/v7.5.1/gradle/wrapper/gradle-wrapper.jar -o android/gradle/wrapper/gradle-wrapper.jar
+              chmod +x android/gradlew
+              cd android
+              ./gradlew assembleRelease --no-daemon
+            displayName: "Build release APK"
+
+          - script: |
+              ls -lh android/app/build/outputs/apk/release/
+              test -f android/app/build/outputs/apk/release/app-release.apk
+            displayName: "Verify APK output"
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish APK artifact"
+            inputs:
+              targetPath: "android/app/build/outputs/apk/release/app-release.apk"
+              artifact: "apk"
+              publishLocation: "pipeline"
+
+      # ── iOS Build ──────────────────────────────────────────
+      - job: BuildIOS
+        displayName: "Build iOS IPA"
+        pool:
+          vmImage: "macOS-latest"
+        steps:
+
+          - task: NodeTool@0
+            displayName: "Set up Node.js"
+            inputs:
+              versionSpec: $(NODE_VERSION)
+
+          - script: npm install
+            displayName: "Install Node dependencies"
+
+          - script: |
+              cd ios && pod install --repo-update
+            displayName: "Install CocoaPods"
+
+          - task: InstallAppleCertificate@2
+            displayName: "Install distribution certificate"
+            inputs:
+              certSecureFile: "distribution.p12"
+              certPwd: ""
+              keychain: "temp"
+
+          - task: InstallAppleProvisioningProfile@1
+            displayName: "Install provisioning profile"
+            inputs:
+              provisioningProfileLocation: "secureFiles"
+              provProfileSecureFile: "distribution.mobileprovision"
+
+          - task: Xcode@5
+            displayName: "Build iOS archive"
+            inputs:
+              actions: "build"
+              scheme: "MobileApp"
+              sdk: "iphoneos"
+              configuration: "Release"
+              xcWorkspacePath: "ios/MobileApp.xcworkspace"
+              packageApp: true
+              archivePath: "$(Build.ArtifactStagingDirectory)/MobileApp.xcarchive"
+              exportPath: "$(Build.ArtifactStagingDirectory)/ipa"
+              signingOption: "manual"
+              signingIdentity: "$(APPLE_CERTIFICATE_SIGNING_IDENTITY)"
+              provisioningProfileUuid: "$(APPLE_PROV_PROFILE_UUID)"
+              exportOptionsPlist: "ios/ExportOptions.plist"
+
+          - script: |
+              ls -lh $(Build.ArtifactStagingDirectory)/ipa/
+              test -f "$(Build.ArtifactStagingDirectory)/ipa/MobileApp.ipa"
+            displayName: "Verify IPA output"
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish IPA artifact"
+            inputs:
+              targetPath: "$(Build.ArtifactStagingDirectory)/ipa/MobileApp.ipa"
+              artifact: "ipa"
+              publishLocation: "pipeline"
+
+# ─────────────────────────────────────────────────────────────
+# STAGE 2 — SECURITY SCAN (appknox@2 native task)
+# ─────────────────────────────────────────────────────────────
+
+  - stage: SecurityScan
+    displayName: "Appknox Security Scan"
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['RUN_SECURITY_SCAN'], 'true'))
+    jobs:
+
+      # ── Scan APK ───────────────────────────────────────────
+      - job: ScanAndroid
+        displayName: "Scan APK"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download APK artifact"
+            inputs:
+              artifactName: "apk"
+              targetPath: "$(Pipeline.Workspace)/apk"
+
+          - task: appknox@2
+            displayName: "Appknox SAST scan — APK"
+            inputs:
+              filePath: "$(Pipeline.Workspace)/apk/app-release.apk"
+              accessToken: "$(APPKNOX_ACCESS_TOKEN)"
+              riskThreshold: "high"
+
+          - script: |
+              curl -X POST "$(SLACK_WEBHOOK_URL)" \
+                -H "Content-Type: application/json" \
+                -d "{\"text\": \"🚨 Appknox APK scan FAILED on build $(Build.BuildNumber). Branch: $(Build.SourceBranchName). See: $(Build.BuildUri)\"}"
+            displayName: "Notify team — APK scan failed"
+            condition: failed()
+            env:
+              SLACK_WEBHOOK_URL: $(SLACK_WEBHOOK_URL)
+
+      # ── Scan IPA ───────────────────────────────────────────
+      - job: ScanIOS
+        displayName: "Scan IPA"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download IPA artifact"
+            inputs:
+              artifactName: "ipa"
+              targetPath: "$(Pipeline.Workspace)/ipa"
+
+          - task: appknox@2
+            displayName: "Appknox SAST scan — IPA"
+            inputs:
+              filePath: "$(Pipeline.Workspace)/ipa/MobileApp.ipa"
+              accessToken: "$(APPKNOX_ACCESS_TOKEN)"
+              riskThreshold: "high"
+
+          - script: |
+              curl -X POST "$(SLACK_WEBHOOK_URL)" \
+                -H "Content-Type: application/json" \
+                -d "{\"text\": \"🚨 Appknox IPA scan FAILED on build $(Build.BuildNumber). Branch: $(Build.SourceBranchName). See: $(Build.BuildUri)\"}"
+            displayName: "Notify team — IPA scan failed"
+            condition: failed()
+            env:
+              SLACK_WEBHOOK_URL: $(SLACK_WEBHOOK_URL)
+
+# ─────────────────────────────────────────────────────────────
+# STAGE 3 — DISTRIBUTION
+# ─────────────────────────────────────────────────────────────
+
+  - stage: Distribute
+    displayName: "Distribute builds"
+    dependsOn: SecurityScan
+    condition: and(succeeded(), eq(variables['RUN_DISTRIBUTE'], 'true'))
+    jobs:
+
+      # ── APK → Azure Blob Storage ───────────────────────────
+      - job: DistributeAndroid
+        displayName: "Upload APK to Azure Blob Storage"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download APK artifact"
+            inputs:
+              artifactName: "apk"
+              targetPath: "$(Pipeline.Workspace)/apk"
+
+          - task: AzureCLI@2
+            displayName: "Upload APK to Blob Storage"
+            inputs:
+              azureSubscription: "AzureConnection"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                BUILD_NUMBER=$(Build.BuildNumber)
+                TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+                BLOB_NAME="releases/${TIMESTAMP}-build${BUILD_NUMBER}-app-release.apk"
+
+                az storage blob upload \
+                  --account-name $(AZURE_STORAGE_ACCOUNT) \
+                  --container-name $(AZURE_STORAGE_CONTAINER) \
+                  --name "$BLOB_NAME" \
+                  --file "$(Pipeline.Workspace)/apk/app-release.apk" \
+                  --auth-mode login \
+                  --overwrite
+
+                echo "Uploaded: $BLOB_NAME"
+
+      # ── IPA → TestFlight ───────────────────────────────────
+      - job: DistributeIOS
+        displayName: "Upload IPA to TestFlight"
+        pool:
+          vmImage: "macOS-latest"
+        steps:
+
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download IPA artifact"
+            inputs:
+              artifactName: "ipa"
+              targetPath: "$(Pipeline.Workspace)/ipa"
+
+          - task: AppStoreRelease@1
+            displayName: "Upload to TestFlight"
+            inputs:
+              serviceEndpoint: "AppleAppStoreConnection"
+              appIdentifier: "$(IOS_BUNDLE_ID)"
+              ipaPath: "$(Pipeline.Workspace)/ipa/MobileApp.ipa"
+              shouldSkipWaitingForProcessing: true
+              shouldSkipSubmission: true
+              uploadSymbols: true
+              uploadMetadata: false
+
+
+
+

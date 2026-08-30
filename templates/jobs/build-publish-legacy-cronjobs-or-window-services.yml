@@ -1,0 +1,27 @@
+parameters:
+  - name: BuildType
+    type: string
+
+  - name: poolName
+    type: string
+    default: ''
+    
+  - name: buildConfiguration
+    type: string
+    default: 'Release'
+
+
+jobs:
+  - job: Build_Legacy_CronJobs_WindowsServices
+    displayName: 'Run SAST, SCA scans, Build and Publish CronJob or WindowsService Binary'
+    ${{ if eq(parameters.poolName, '') }}:
+      pool:
+        vmImage: 'windows-latest'
+    ${{ else }}:
+      pool:
+        name: ${{ parameters.poolName }}
+    steps:
+      - template: ../steps/composite/legacy-worker.yml
+        parameters: 
+          buildConfiguration: ${{ parameters.buildConfiguration }}
+          BuildType: ${{ parameters.BuildType }}

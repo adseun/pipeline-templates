@@ -1,0 +1,48 @@
+parameters:
+  - name: BuildType
+    type: string
+
+  - name: poolName
+    type: string
+    default: ''
+  - name: nodeVersion
+    type: string
+    default: '24.x'
+  - name: buildCommand
+    type: string
+    default: 'npm run build'
+  - name: buildOutputPath
+    type: string
+    default: 'dist'
+
+  - name: projectName
+    type: string
+  
+  - name: environment
+    type: string
+  
+  - name: useKeyVault
+    type: boolean
+    default: false
+    
+
+jobs:
+  - job: Build_Frontend
+    displayName: 'Run SAST, SCA scans, Build and Publish Application'
+    ${{ if eq(parameters.poolName, '') }}:
+      pool:
+        vmImage: 'ubuntu-latest'
+    ${{ else }}:
+      pool:
+        name: ${{ parameters.poolName }}
+    steps:
+      - template: ../steps/composite/frontend.yml
+        parameters:
+          nodeVersion: ${{ parameters.nodeVersion }}
+          buildCommand: ${{ parameters.buildCommand }}
+          buildOutputPath: ${{ parameters.buildOutputPath }}
+          BuildType: ${{ parameters.BuildType }}
+          projectName: ${{ parameters.projectName }}
+          useKeyVault: ${{ parameters.useKeyVault }}
+          environment: ${{ parameters.environment }}
+

@@ -1,0 +1,45 @@
+parameters:
+  - name: deploymentParameters   # platform‑specific parameters
+    type: object
+    default: {}
+
+  - name: buildJobTemplate
+    type: string
+  - name: buildJobParameters
+    type: object
+    default: {}
+stages:
+  # Main deployment stage
+  - stage: Deploy_${{ parameters.buildJobParameters.environment }}
+    displayName: 'Deploy to ${{ parameters.buildJobParameters.environment }} (${{ parameters.buildJobParameters.target }})'
+    ${{ if startsWith(lower(variables['Build.SourceBranch']), 'refs/heads/hotfix/') }}:
+      dependsOn: 
+        - Build_And_Security
+        - Promote_Container_Image_HotFix_${{ parameters.buildJobParameters.environment}}
+    ${{ else }}:
+       dependsOn: 
+        - Build_And_Security
+        - Promote_Container_Image
+    
+    condition: succeeded()
+    variables:
+      ${{ if eq(parameters.buildJobParameters.environment, 'dev') }}:
+        CONSUMED_TAG: $[ stageDependencies.Build_Container_Image.Build_And_Push_Image.outputs['tagAndPush.IMMUTABLE_TAG'] ]
+        IMMUTABLE_TAG: $[ variables['CONSUMED_TAG'] ]
+      ${{ else }}:
+        IMMUTABLE_TAG: $[ variables['IMMUTABLE_TAG'] ]
+
+      # Load environment-specific configuration
+      ${{ each envVar in parameters.buildJobParameters.environmentConfig }}:
+        ${{ envVar.key }}: ${{ envVar.value }}
+    jobs:
+      - template: ${{ parameters.buildJobTemplate }}
+        parameters: 
+          environmentConfig: ${{ parameters.buildJobParameters.environmentConfig }}
+          environment: ${{ parameters.buildJobParameters.environment }}
+          projectName:  ${{ parameters.buildJobParameters.projectName }}
+          # ${{ each envVar in parameters.buildJobParameters.deploymentParameters }}:
+          #   ${{ envVar.key }}: ${{ envVar.value }}
+          ${{ each envVar in parameters.deploymentParameters }}:
+            ${{ envVar.Key }}: ${{ envVar.Value }}
+

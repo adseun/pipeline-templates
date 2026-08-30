@@ -1,0 +1,108 @@
+parameters:
+  - name: sourceRegistryName
+    type: string
+  - name: sourceRegistryPassword
+    type: string
+  - name: imageName
+    type: string
+  - name: imageVersion
+    type: string
+    default: latest
+  - name: environment
+    type: string
+    default: 'dev'
+  - name: dockerFilePath
+    type: string
+    default: ''
+  - name: projectName
+    type: string
+
+
+steps:
+    - script: |
+        # Check imageName: lowercase alphanumeric and hyphens only
+        if [[ ! "${{ parameters.imageName }}" =~ ^[a-z0-9-]+$ ]]; then
+          echo "##vso[task.logissue type=error]Invalid imageName: ${{ parameters.imageName }}. Must be lowercase alphanumeric and hyphens only."
+          exit 1
+        fi
+
+        if [[ ! "${{ parameters.projectName }}" =~ ^[a-z0-9-]+$ ]]; then
+          echo "##vso[task.logissue type=error]Invalid projectName: ${{ parameters.projectName }}. Must be lowercase alphanumeric and hyphens only."
+          exit 1
+        fi
+
+        # Check imageVersion: must follow 0.0.0 format
+        if [[ ! "${{ parameters.imageVersion }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "##vso[task.logissue type=error]Invalid imageVersion: ${{ parameters.imageVersion }}. Must follow 0.0.0 format."
+          exit 1
+        fi
+      displayName: 'Parameter Validation'
+    
+    - ${{ if ne(parameters.dockerFilePath, '') }}:
+      - script: |
+          if [ "$(isHotFix)" == "true" ]; then
+            IMMUTABLE_TAG="hotfix-$(Build.BuildId)"
+          else 
+            IMMUTABLE_TAG="$(Build.BuildId)"
+          fi
+          echo "Using custom Dockerfile path: ${{ parameters.dockerFilePath }}"
+          docker build -f "${{ parameters.dockerFilePath }}" -t ${{ parameters.sourceRegistryName }}.azurecr.io/${{ parameters.imageName }}:$IMMUTABLE_TAG $(Build.SourcesDirectory)
+        displayName: 'Build Docker Image Locally (Custom Path)'
+
+    - ${{ if eq(parameters.dockerFilePath, '') }}:
+      - script: |
+          if [ "$(isHotFix)" == "true" ]; then
+            IMMUTABLE_TAG="hotfix-$(Build.BuildId)"
+          else 
+            IMMUTABLE_TAG="$(Build.BuildId)"
+          fi
+          echo "Using default Dockerfile at context root"
+          docker build -t ${{ parameters.sourceRegistryName }}.azurecr.io/${{ parameters.imageName }}:$IMMUTABLE_TAG $(Build.SourcesDirectory)
+        displayName: 'Build Docker Image Locally'
+      
+    # - script: |
+    #     IMMUTABLE_TAG="$(Build.BuildId)"
+    #      # Check if dockerFilePath parameter is provided using compile-time expressions
+    #     ${{ if ne(parameters.dockerFilePath, '') }}:
+    #       echo "Using custom Dockerfile path: ${{ parameters.dockerFilePath }}"
+    #       docker build -f "${{ parameters.dockerFilePath }}" -t ${{ parameters.sourceRegistryName }}.azurecr.io/${{ parameters.imageName }}:$IMMUTABLE_TAG $(Build.SourcesDirectory)
+    #     ${{ else }}:
+    #       echo "Using default Dockerfile at context root"
+    #       docker build -t ${{ parameters.sourceRegistryName }}.azurecr.io/${{ parameters.imageName }}:$IMMUTABLE_TAG $(Build.SourcesDirectory)
+    #   displayName: 'Build Docker Image Locally'
+
+    - script: |
+        set -e
+        
+        IMAGE_BASE="${{ parameters.sourceRegistryName }}.azurecr.io/${{ parameters.imageName }}"
+        DATESTAMP=$(date +%d%m%Y)
+        
+        # The IMMUTABLE tag is Build.BuildId - this is the ONLY tag that matters
+        if [ "$(isHotFix)" == "true" ]; then
+          IMMUTABLE_TAG="hotfix-$(Build.BuildId)"
+        else 
+          IMMUTABLE_TAG="$(Build.BuildId)"
+        fi
+        
+        # Tag with various formats (for convenience, but NOT for deployment)
+        docker tag $IMAGE_BASE:$IMMUTABLE_TAG $IMAGE_BASE:${{ parameters.imageVersion }}  # Primary - USE THIS FOR DEPLOYMENT
+        docker tag $IMAGE_BASE:$IMMUTABLE_TAG $IMAGE_BASE:$DATESTAMP      # For date-based reference
+        docker tag $IMAGE_BASE:$IMMUTABLE_TAG $IMAGE_BASE:${{ parameters.environment }}  # Environment alias
+        
+        # Login and push ALL tags
+        echo "$REGISTRY_PASSWORD" | docker login -u ${{ parameters.sourceRegistryName }} --password-stdin ${{ parameters.sourceRegistryName }}.azurecr.io
+        docker push $IMAGE_BASE --all-tags
+        
+        # CRITICAL: Store the immutable tag for later stages
+        echo "##vso[task.setvariable variable=IMMUTABLE_TAG;isOutput=true]$IMMUTABLE_TAG"
+        echo "##vso[task.setvariable variable=FULL_IMAGE_PATH;isOutput=true]$IMAGE_BASE:$IMMUTABLE_TAG"
+        
+        # Also write to a file that can be published as artifact
+        echo "$IMMUTABLE_TAG" > $(Build.ArtifactStagingDirectory)/immutable-tag.txt
+        echo "$IMAGE_BASE:$IMMUTABLE_TAG" > $(Build.ArtifactStagingDirectory)/full-image-path.txt
+      name: tagAndPush
+      displayName: 'Tag and push images'
+      env:
+        REGISTRY_PASSWORD: ${{ parameters.sourceRegistryPassword }}
+
+   

@@ -1,0 +1,113 @@
+parameters:
+  # Language/stack, passed to the Snyk scan and the build steps
+  - name: BuildType
+    type: string
+
+  - name: buildConfiguration
+    type: string
+    default: 'Release'
+
+
+  - name: mainProjectFile
+    type: string
+    default: 'src/DevSecOpsUI.Service/DevSecOpsUI.Service.csproj' # The executable entry point project
+
+steps:
+  - checkout: self
+    clean: true
+
+  # SAST steps
+  - template: ../security/sast-snyk.yml
+    parameters:
+      BuildType: ${{ parameters.BuildType }}
+  
+  - ${{ if eq(parameters.BuildType, 'dotnet') }}:
+    - task: NuGetToolInstaller@1
+
+    - task: NuGetCommand@2
+      inputs:
+        restoreSolution: '**/*.sln'
+        command: 'restore'
+
+    # Cleaned MSBuild arguments to target standard runtime executables, avoiding IIS package failures
+    - task: VSBuild@1
+      inputs:
+        solution: '**/*.sln'
+        msbuildArgs: '/p:Configuration=${{ parameters.buildConfiguration }} /p:NoWarn="NU1605;NU1701" /p:SkipInvalidConfigurations=true'
+        platform: 'Any CPU'
+        configuration: ${{ parameters.buildConfiguration }}
+
+    - task: VSTest@2
+      displayName: 'Run Legacy Tests & Collect Coverage'
+      inputs:
+        testSelector: 'testAssemblies'
+        testAssemblyVer2: |
+            **\*test*.dll
+            !**\*TestAdapter.dll
+            !**\obj\**
+        searchFolder: '$(System.DefaultWorkingDirectory)'
+        configuration: ${{ parameters.buildConfiguration }}
+        publishRunAttachments: true 
+        codeCoverageEnabled: true
+
+    # Set publishWebProjects to false and explicitly targeted projects to capture Windows Services/Console Apps
+    - task: DotNetCoreCLI@2
+      displayName: 'Publish Windows Service / Cron Binary'
+      inputs:
+        command: 'publish'
+        publishWebProjects: false
+        # projects: '${{ parameters.mainProjectFile }}' 
+        projects: '**/*.csproj'  # Compiles all matching sub-projects or matches your specific service project
+        arguments: '--configuration ${{ parameters.buildConfiguration }} --output $(Build.ArtifactStagingDirectory)'
+        # zipAfterPublish: true    # Automatically creates the .zip archive required by your deployment script
+      continueOnError: false 
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'drop'
+
+    # -------------------------------------------------------------
+    #  MANAGE 10% COVERAGE THRESHOLD FOR LEGACY PROJECTS (if tests exist)
+    # -------------------------------------------------------------
+    - script: |
+        echo "Installing ReportGenerator Global Tool..."
+        dotnet tool install --global dotnet-reportgenerator-globaltool
+      displayName: 'Install ReportGenerator'
+      condition: succeeded()
+
+    - powershell: |
+        $searchDir = "$(Agent.TempDirectory)"
+        Write-Host "Searching for coverage files in $searchDir..."
+        
+        $coverageFiles = Get-ChildItem -Path $searchDir -Filter "*.coverage" -Recurse
+        if (-not $coverageFiles) {
+            $coverageFiles = Get-ChildItem -Path $searchDir -Filter "*.cobertura.xml" -Recurse
+        }
+        
+        if (-not $coverageFiles) {
+            Write-Host "No test coverage files found. Skipping threshold validation."
+            exit 0
+        }
+        
+        Write-Host "Found coverage files. Evaluating 10% metric threshold..."
+        
+        reportgenerator `
+        -reports:"$searchDir\**\*.coverage" `
+        -targetdir:"$(Build.SourcesDirectory)\TestResults\CoverageReport" `
+        -reporttypes:"HtmlInline_AzurePipelines;Cobertura" `
+        -failonoptions:LineCoverageLessThan10
+        
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "Code coverage is below the mandatory 10% threshold!"
+            exit $LASTEXITCODE
+        }
+      displayName: 'Validate 10% Coverage Threshold'
+      condition: succeeded()
+
+    - task: PublishCodeCoverageResults@2
+      displayName: 'Publish Code Coverage Report'
+      condition: succeeded()
+      inputs:
+        summaryFileLocation: '$(Build.SourcesDirectory)/TestResults/CoverageReport/Cobertura.xml'
+        failIfCoverageEmpty: false
